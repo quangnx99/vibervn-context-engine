@@ -6,21 +6,46 @@
   <title>Context Engine Settings</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
-    tailwind.config = { darkMode: 'class' };
-    // Apply saved preference before paint
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            wiki: {
+              bg: '#101418',
+              surface: '#1b2024',
+              border: '#2e3a42',
+              'border-active': '#5a9ecf',
+              text: '#c8ccd1',
+              'text-muted': '#8899a6',
+              heading: '#e3e8ed',
+              link: '#6b9fce',
+              'link-hover': '#8bb8e0',
+            }
+          }
+        }
+      }
+    };
     if (localStorage.getItem('theme') === 'light') {
       document.documentElement.classList.remove('dark');
     }
   </script>
+  <style>
+    .font-wiki { font-family: 'Linux Libertine', 'Georgia', 'Times', serif; }
+  </style>
 </head>
-<body class="bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 min-h-screen transition-colors duration-200">
+<body class="bg-gray-50 dark:bg-wiki-bg text-gray-900 dark:text-wiki-text min-h-screen transition-colors duration-200">
 
-<div class="max-w-2xl mx-auto px-4 py-10">
-  <div class="flex items-center justify-between mb-1">
-    <h1 class="text-2xl font-semibold">Context Engine</h1>
+<div class="max-w-3xl mx-auto px-6 py-8">
+  <!-- Header -->
+  <div class="flex items-end justify-between border-b border-gray-200 dark:border-wiki-border pb-4 mb-6">
+    <div>
+      <h1 class="font-wiki text-3xl dark:text-wiki-heading text-gray-900">Context Engine</h1>
+      <p class="text-sm text-gray-500 dark:text-wiki-text-muted mt-1">Settings</p>
+    </div>
     <button id="btn-theme" aria-label="Toggle dark mode"
-            class="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800
-                   focus:outline-none focus:ring-2 focus:ring-gray-400 transition-colors">
+            class="p-2 rounded text-gray-500 dark:text-wiki-text-muted hover:bg-gray-100 dark:hover:bg-wiki-surface
+                   focus:outline-none focus:ring-2 focus:ring-blue-400 transition-colors">
       <svg id="icon-sun" class="w-5 h-5 hidden" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
         <circle cx="12" cy="12" r="5"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
       </svg>
@@ -29,54 +54,55 @@
       </svg>
     </button>
   </div>
-  <p class="text-gray-500 dark:text-gray-400 text-sm mb-8">Settings</p>
 
   <!-- Version-too-new banner (hidden by default) -->
-  <div id="banner-version" class="hidden mb-6 p-4 border border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-900/30 rounded-lg text-red-800 dark:text-red-300 text-sm">
+  <div id="banner-version" class="hidden mb-6 p-4 border border-red-400/40 dark:border-red-700/50 bg-red-50 dark:bg-red-900/20 rounded text-red-800 dark:text-red-300 text-sm">
     This config was written by a newer version of Context Engine. Upgrade the binary or
     replace <code class="font-mono">settings.json</code> with an older backup.
   </div>
 
   <!-- Generic error banner -->
-  <div id="banner-error" class="hidden mb-6 p-4 border border-orange-300 dark:border-orange-700 bg-orange-50 dark:bg-orange-900/30 rounded-lg text-sm">
+  <div id="banner-error" class="hidden mb-6 p-4 border border-orange-400/40 dark:border-orange-700/50 bg-orange-50 dark:bg-orange-900/20 rounded text-sm">
     <div class="flex items-center justify-between">
       <span id="banner-error-msg" class="text-orange-800 dark:text-orange-300"></span>
       <button id="btn-retry" class="ml-4 px-3 py-1 text-xs rounded border border-orange-400 dark:border-orange-600 text-orange-700 dark:text-orange-300
-             hover:bg-orange-100 dark:hover:bg-orange-800 focus:outline-none focus:ring-2 focus:ring-orange-400">
+             hover:bg-orange-100 dark:hover:bg-orange-900/40 focus:outline-none focus:ring-2 focus:ring-orange-400">
         Retry
       </button>
     </div>
   </div>
 
   <!-- "Saved" toast -->
-  <div id="toast-saved" class="hidden fixed bottom-6 right-6 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 text-sm px-4 py-2 rounded-lg shadow-lg
+  <div id="toast-saved" class="hidden fixed bottom-6 right-6 bg-gray-900 dark:bg-wiki-surface dark:border dark:border-wiki-border-active text-white dark:text-wiki-text text-sm px-4 py-2 rounded shadow-lg
        transition-opacity duration-300 opacity-0">
     Saved
   </div>
 
   <!-- Loading skeleton -->
   <div id="skeleton" class="space-y-3">
-    <div class="h-8 bg-gray-100 dark:bg-gray-800 rounded w-64 animate-pulse"></div>
-    <div class="h-32 bg-gray-100 dark:bg-gray-800 rounded animate-pulse"></div>
+    <div class="h-8 bg-gray-100 dark:bg-wiki-surface rounded w-64 animate-pulse"></div>
+    <div class="h-32 bg-gray-100 dark:bg-wiki-surface rounded animate-pulse"></div>
   </div>
 
   <!-- Main content (hidden until loaded) -->
   <div id="main-content" class="hidden">
-    <!-- Tab bar -->
-    <div role="tablist" class="flex border-b border-gray-200 dark:border-gray-700 mb-6 gap-1">
+    <!-- Tab bar (Wikipedia-style underline tabs) -->
+    <div role="tablist" class="flex border-b border-gray-200 dark:border-wiki-border mb-6">
       <button role="tab" id="tab-repos" aria-selected="true" aria-controls="panel-repos"
-              class="tab-btn px-4 py-2 text-sm font-medium rounded-t border-b-2 border-gray-900 dark:border-gray-100 text-gray-900 dark:text-gray-100
-                     focus:outline-none focus:ring-2 focus:ring-gray-400">
+              class="tab-btn px-4 py-2 text-sm border-b-2 border-blue-600 dark:border-wiki-border-active text-gray-900 dark:text-wiki-heading
+                     focus:outline-none focus:ring-2 focus:ring-blue-400">
         Repositories
       </button>
       <button role="tab" id="tab-embedding" aria-selected="false" aria-controls="panel-embedding"
-              class="tab-btn px-4 py-2 text-sm font-medium rounded-t border-b-2 border-transparent text-gray-500 dark:text-gray-400
-                     hover:text-gray-900 dark:hover:text-gray-100 focus:outline-none focus:ring-2 focus:ring-gray-400">
+              class="tab-btn px-4 py-2 text-sm border-b-2 border-transparent text-gray-500 dark:text-wiki-text-muted
+                     hover:text-gray-900 dark:hover:text-wiki-heading hover:border-gray-300 dark:hover:border-wiki-border
+                     focus:outline-none focus:ring-2 focus:ring-blue-400">
         Embedding Providers
       </button>
       <button role="tab" id="tab-llm" aria-selected="false" aria-controls="panel-llm"
-              class="tab-btn px-4 py-2 text-sm font-medium rounded-t border-b-2 border-transparent text-gray-500 dark:text-gray-400
-                     hover:text-gray-900 dark:hover:text-gray-100 focus:outline-none focus:ring-2 focus:ring-gray-400">
+              class="tab-btn px-4 py-2 text-sm border-b-2 border-transparent text-gray-500 dark:text-wiki-text-muted
+                     hover:text-gray-900 dark:hover:text-wiki-heading hover:border-gray-300 dark:hover:border-wiki-border
+                     focus:outline-none focus:ring-2 focus:ring-blue-400">
         LLM Keys
       </button>
     </div>
@@ -84,16 +110,17 @@
     <!-- Tab: Repositories -->
     <div role="tabpanel" id="panel-repos">
       <div id="repos-list" class="space-y-2 mb-4"></div>
-      <div id="repos-empty" class="hidden text-gray-400 dark:text-gray-500 text-sm mb-4">
+      <div id="repos-empty" class="hidden text-gray-400 dark:text-wiki-text-muted text-sm mb-4">
         No repositories configured. Add an absolute path below.
       </div>
       <form id="form-add-repo" class="flex gap-2" onsubmit="return false;">
         <input id="input-repo" type="text" placeholder="/absolute/path/to/repo"
-               class="flex-1 border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 rounded px-3 py-2 text-sm
-                      focus:outline-none focus:ring-2 focus:ring-gray-400" />
+               class="flex-1 border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface rounded px-3 py-2 text-sm
+                      text-gray-900 dark:text-wiki-text placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                      focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
         <button type="submit" id="btn-add-repo"
-                class="px-4 py-2 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 text-sm rounded
-                       hover:bg-gray-700 dark:hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-gray-400">
+                class="px-4 py-2 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded
+                       hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400">
           Add
         </button>
       </form>
@@ -105,32 +132,34 @@
     <!-- Tab: Embedding Providers -->
     <div role="tabpanel" id="panel-embedding" class="hidden">
       <div class="mb-4">
-        <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Provider</label>
+        <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1">Provider</label>
         <select id="embedding-provider"
-                class="border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 rounded px-3 py-2 text-sm
-                       focus:outline-none focus:ring-2 focus:ring-gray-400">
+                class="border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
+                       focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active">
           <option value="voyage">Voyage AI</option>
         </select>
       </div>
       <div class="mb-4">
-        <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1" for="embedding-model">
+        <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="embedding-model">
           Embedding model
         </label>
         <input id="embedding-model" type="text" placeholder="e.g. voyage-4-lite"
-               class="w-full border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 rounded px-3 py-2 text-sm
-                      focus:outline-none focus:ring-2 focus:ring-gray-400" />
+               class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
+                      placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                      focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
       </div>
       <div class="mb-2">
-        <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">API keys</label>
+        <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1">API keys</label>
         <div id="embedding-keys-list" class="space-y-2 mb-2"></div>
       </div>
       <form id="form-add-embedding-key" class="flex gap-2" onsubmit="return false;">
         <input id="input-embedding-key" type="text" placeholder="Paste API key"
-               class="flex-1 border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 rounded px-3 py-2 text-sm font-mono
-                      focus:outline-none focus:ring-2 focus:ring-gray-400" />
+               class="flex-1 border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm font-mono
+                      placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                      focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
         <button type="submit"
-                class="px-4 py-2 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 text-sm rounded
-                       hover:bg-gray-700 dark:hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-gray-400">
+                class="px-4 py-2 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded
+                       hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400">
           Add
         </button>
       </form>
@@ -139,32 +168,34 @@
     <!-- Tab: LLM Keys -->
     <div role="tabpanel" id="panel-llm" class="hidden">
       <div class="mb-4">
-        <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Provider</label>
+        <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1">Provider</label>
         <select id="llm-provider"
-                class="border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 rounded px-3 py-2 text-sm
-                       focus:outline-none focus:ring-2 focus:ring-gray-400">
+                class="border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
+                       focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active">
           <option value="google">Google</option>
         </select>
       </div>
       <div class="mb-4">
-        <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1" for="llm-rerank-model">
+        <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="llm-rerank-model">
           Rerank model
         </label>
         <input id="llm-rerank-model" type="text" placeholder="e.g. gemini-3.1-flash-lite"
-               class="w-full border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 rounded px-3 py-2 text-sm
-                      focus:outline-none focus:ring-2 focus:ring-gray-400" />
+               class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
+                      placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                      focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
       </div>
       <div class="mb-2">
-        <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">API keys</label>
+        <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1">API keys</label>
         <div id="llm-keys-list" class="space-y-2 mb-2"></div>
       </div>
       <form id="form-add-llm-key" class="flex gap-2" onsubmit="return false;">
         <input id="input-llm-key" type="text" placeholder="Paste API key"
-               class="flex-1 border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 rounded px-3 py-2 text-sm font-mono
-                      focus:outline-none focus:ring-2 focus:ring-gray-400" />
+               class="flex-1 border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm font-mono
+                      placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                      focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
         <button type="submit"
-                class="px-4 py-2 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 text-sm rounded
-                       hover:bg-gray-700 dark:hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-gray-400">
+                class="px-4 py-2 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded
+                       hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400">
           Add
         </button>
       </form>
@@ -174,14 +205,13 @@
 
 <script>
 // ─── State ────────────────────────────────────────────────────────────────
-let cfg = null;       // current Settings object
-let saveTimer = null; // debounce handle
+let cfg = null;
+let saveTimer = null;
 
 // ─── Utility ──────────────────────────────────────────────────────────────
 function maskKey(k) {
   if (!k) return '••••••••';
-  const last4 = k.slice(-4);
-  return '••••••••' + last4;
+  return '••••••••' + k.slice(-4);
 }
 
 function showToast() {
@@ -196,9 +226,8 @@ function showToast() {
 }
 
 function showError(msg) {
-  const el = document.getElementById('banner-error');
   document.getElementById('banner-error-msg').textContent = msg;
-  el.classList.remove('hidden');
+  document.getElementById('banner-error').classList.remove('hidden');
 }
 
 function hideError() {
@@ -223,13 +252,13 @@ function activateTab(idx) {
     const panel = document.getElementById(t.panel);
     if (i === idx) {
       btn.setAttribute('aria-selected', 'true');
-      btn.classList.remove('border-transparent', 'text-gray-500', 'dark:text-gray-400');
-      btn.classList.add('border-gray-900', 'dark:border-gray-100', 'text-gray-900', 'dark:text-gray-100');
+      btn.classList.remove('border-transparent', 'text-gray-500', 'dark:text-wiki-text-muted');
+      btn.classList.add('border-blue-600', 'dark:border-wiki-border-active', 'text-gray-900', 'dark:text-wiki-heading');
       panel.classList.remove('hidden');
     } else {
       btn.setAttribute('aria-selected', 'false');
-      btn.classList.add('border-transparent', 'text-gray-500', 'dark:text-gray-400');
-      btn.classList.remove('border-gray-900', 'dark:border-gray-100', 'text-gray-900', 'dark:text-gray-100');
+      btn.classList.add('border-transparent', 'text-gray-500', 'dark:text-wiki-text-muted');
+      btn.classList.remove('border-blue-600', 'dark:border-wiki-border-active', 'text-gray-900', 'dark:text-wiki-heading');
       panel.classList.add('hidden');
     }
   });
@@ -251,18 +280,17 @@ function renderRepos() {
   empty.classList.add('hidden');
   cfg.repos.forEach((repo, idx) => {
     const row = document.createElement('div');
-    row.className = 'flex items-center justify-between border border-gray-200 dark:border-gray-700 rounded px-3 py-2 text-sm';
+    row.className = 'flex items-center justify-between border border-gray-200 dark:border-wiki-border rounded px-3 py-2 text-sm bg-white dark:bg-wiki-surface';
     row.innerHTML = `
-      <span class="font-mono text-gray-800 dark:text-gray-200 truncate flex-1 mr-2">${escHtml(repo)}</span>
-      <button data-idx="${idx}" class="btn-remove-repo text-gray-400 hover:text-red-500 text-xs
+      <span class="font-mono text-gray-800 dark:text-wiki-text truncate flex-1 mr-2">${escHtml(repo)}</span>
+      <button data-idx="${idx}" class="btn-remove-repo text-gray-400 dark:text-wiki-text-muted hover:text-red-500 dark:hover:text-red-400 text-xs
               focus:outline-none focus:ring-2 focus:ring-red-300 rounded px-2 py-1">Remove</button>
     `;
     list.appendChild(row);
   });
   list.querySelectorAll('.btn-remove-repo').forEach(btn => {
     btn.addEventListener('click', () => {
-      const i = parseInt(btn.dataset.idx, 10);
-      cfg.repos.splice(i, 1);
+      cfg.repos.splice(parseInt(btn.dataset.idx, 10), 1);
       renderRepos();
       saveNow();
     });
@@ -274,14 +302,14 @@ function renderKeyList(containerId, keys, onRemove) {
   container.innerHTML = '';
   (keys || []).forEach((key, idx) => {
     const row = document.createElement('div');
-    row.className = 'flex items-center gap-2 border border-gray-200 dark:border-gray-700 rounded px-3 py-2 text-sm';
+    row.className = 'flex items-center gap-2 border border-gray-200 dark:border-wiki-border rounded px-3 py-2 text-sm bg-white dark:bg-wiki-surface';
     const display = document.createElement('span');
-    display.className = 'font-mono text-gray-800 dark:text-gray-200 flex-1 truncate';
+    display.className = 'font-mono text-gray-800 dark:text-wiki-text flex-1 truncate';
     display.textContent = maskKey(key);
     let revealed = false;
     const showBtn = document.createElement('button');
     showBtn.textContent = 'Show';
-    showBtn.className = 'text-xs text-gray-400 hover:text-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-300 rounded px-2 py-1';
+    showBtn.className = 'text-xs text-gray-400 dark:text-wiki-text-muted hover:text-gray-700 dark:hover:text-wiki-link focus:outline-none focus:ring-2 focus:ring-blue-300 rounded px-2 py-1';
     showBtn.addEventListener('click', () => {
       revealed = !revealed;
       display.textContent = revealed ? key : maskKey(key);
@@ -289,10 +317,8 @@ function renderKeyList(containerId, keys, onRemove) {
     });
     const removeBtn = document.createElement('button');
     removeBtn.textContent = 'Remove';
-    removeBtn.className = 'text-xs text-gray-400 hover:text-red-500 focus:outline-none focus:ring-2 focus:ring-red-300 rounded px-2 py-1';
-    removeBtn.addEventListener('click', () => {
-      onRemove(idx);
-    });
+    removeBtn.className = 'text-xs text-gray-400 dark:text-wiki-text-muted hover:text-red-500 dark:hover:text-red-400 focus:outline-none focus:ring-2 focus:ring-red-300 rounded px-2 py-1';
+    removeBtn.addEventListener('click', () => { onRemove(idx); });
     row.appendChild(display);
     row.appendChild(showBtn);
     row.appendChild(removeBtn);
@@ -302,8 +328,6 @@ function renderKeyList(containerId, keys, onRemove) {
 
 function renderAll() {
   renderRepos();
-
-  // Embedding
   document.getElementById('embedding-provider').value = cfg.embedding.provider || 'voyage';
   document.getElementById('embedding-model').value = cfg.embedding.model || '';
   renderKeyList('embedding-keys-list', cfg.embedding.api_keys, (idx) => {
@@ -311,8 +335,6 @@ function renderAll() {
     renderAll();
     saveNow();
   });
-
-  // LLM
   document.getElementById('llm-provider').value = cfg.llm.provider || 'google';
   document.getElementById('llm-rerank-model').value = cfg.llm.rerank_model || '';
   renderKeyList('llm-keys-list', cfg.llm.api_keys, (idx) => {
@@ -330,12 +352,11 @@ function escHtml(str) {
 async function saveNow() {
   clearTimeout(saveTimer);
   hideError();
-  const payload = JSON.parse(JSON.stringify(cfg)); // deep clone
   try {
     const res = await fetch('/api/config', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(cfg),
     });
     if (res.status === 409) { showVersionBanner(); return; }
     if (!res.ok) {
@@ -343,8 +364,7 @@ async function saveNow() {
       showError(data.error || `Save failed (HTTP ${res.status})`);
       return;
     }
-    const saved = await res.json();
-    cfg = saved;
+    cfg = await res.json();
     showToast();
   } catch (err) {
     showError('Network error: ' + err.message);
@@ -380,14 +400,8 @@ async function loadConfig() {
 }
 
 // ─── Event wiring ─────────────────────────────────────────────────────────
+document.getElementById('btn-retry').addEventListener('click', () => { hideError(); loadConfig(); });
 
-// Retry button
-document.getElementById('btn-retry').addEventListener('click', () => {
-  hideError();
-  loadConfig();
-});
-
-// Add repo
 function handleAddRepo() {
   const input = document.getElementById('input-repo');
   const val = input.value.trim();
@@ -401,14 +415,12 @@ function handleAddRepo() {
   renderRepos();
   saveNow();
 }
-
 document.getElementById('form-add-repo').addEventListener('submit', handleAddRepo);
 document.getElementById('btn-add-repo').addEventListener('click', handleAddRepo);
 document.getElementById('input-repo').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); handleAddRepo(); }
 });
 
-// Add embedding key
 function handleAddEmbeddingKey() {
   const input = document.getElementById('input-embedding-key');
   const val = input.value.trim();
@@ -419,13 +431,11 @@ function handleAddEmbeddingKey() {
   renderAll();
   saveNow();
 }
-
 document.getElementById('form-add-embedding-key').addEventListener('submit', handleAddEmbeddingKey);
 document.getElementById('input-embedding-key').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); handleAddEmbeddingKey(); }
 });
 
-// Add LLM key
 function handleAddLlmKey() {
   const input = document.getElementById('input-llm-key');
   const val = input.value.trim();
@@ -436,26 +446,20 @@ function handleAddLlmKey() {
   renderAll();
   saveNow();
 }
-
 document.getElementById('form-add-llm-key').addEventListener('submit', handleAddLlmKey);
 document.getElementById('input-llm-key').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); handleAddLlmKey(); }
 });
 
-// Debounced text inputs
 document.getElementById('embedding-model').addEventListener('input', (e) => {
   if (cfg) { cfg.embedding.model = e.target.value; saveDebounced(); }
 });
-
 document.getElementById('llm-rerank-model').addEventListener('input', (e) => {
   if (cfg) { cfg.llm.rerank_model = e.target.value; saveDebounced(); }
 });
-
-// Provider dropdowns (no save needed now — single option, but wire for forward compat)
 document.getElementById('embedding-provider').addEventListener('change', (e) => {
   if (cfg) { cfg.embedding.provider = e.target.value; saveNow(); }
 });
-
 document.getElementById('llm-provider').addEventListener('change', (e) => {
   if (cfg) { cfg.llm.provider = e.target.value; saveNow(); }
 });
@@ -466,13 +470,11 @@ function updateThemeIcon() {
   document.getElementById('icon-sun').classList.toggle('hidden', !isDark);
   document.getElementById('icon-moon').classList.toggle('hidden', isDark);
 }
-
 document.getElementById('btn-theme').addEventListener('click', () => {
   const isDark = document.documentElement.classList.toggle('dark');
   localStorage.setItem('theme', isDark ? 'dark' : 'light');
   updateThemeIcon();
 });
-
 updateThemeIcon();
 
 // ─── Init ─────────────────────────────────────────────────────────────────
