@@ -74,6 +74,11 @@ impl VoyageClient {
         })
     }
 
+    /// Return the configured embedding model name.
+    pub fn model(&self) -> &str {
+        &self.inner.model
+    }
+
     /// Embed a single query string with bounded retry.
     ///
     /// Uses `input_type: "query"`. On 429 from all keys, waits 2 s and retries

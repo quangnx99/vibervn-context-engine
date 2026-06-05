@@ -403,7 +403,19 @@ async fn run_consumer(
             let n_keys = settings_ref.embedding.api_keys.len().max(1);
             let configured = settings_ref.embedding.embed_concurrency;
             let embed_concurrency = configured * n_keys;
-            IndexPipeline::new_with_concurrency(repo.clone(), voyage_client, embed_concurrency)
+
+            // Build the embedding cache — uses the model name from settings so
+            // different model configurations get isolated cache directories.
+            let embed_cache = if let Some(ref client) = voyage_client {
+                crate::embedding::cache::EmbeddingCache::new(
+                    &engine_ref.home_dir,
+                    client.model(),
+                )
+            } else {
+                None
+            };
+
+            IndexPipeline::new_with_concurrency(repo.clone(), voyage_client, embed_concurrency, embed_cache)
         };
 
         match pipeline

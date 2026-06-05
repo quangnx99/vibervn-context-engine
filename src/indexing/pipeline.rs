@@ -11,10 +11,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::embedding::InputType;
+use crate::embedding::cache::EmbeddingCache;
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::ProgressHandle;
 use crate::indexing::tracker::{ChangeKind, FileChange, stat_file};
-use crate::indexing::walker::walk_repo;
+use crate::indexing::walker::{is_under_hidden_dir, walk_repo};
 use crate::parsing::parse_file;
 use crate::parsing::relations::{EdgeKind, EdgeTarget};
 use crate::parsing::symbols::Symbol;
@@ -110,16 +111,18 @@ pub struct IndexPipeline {
     voyage: Option<VoyageClient>,
     /// Concurrent embedding batches in-flight. Derived from config or api_keys.len()*4.
     embed_concurrency: usize,
+    /// Optional file-based embedding cache to avoid redundant Voyage API calls.
+    cache: Option<Arc<EmbeddingCache>>,
 }
 
 impl IndexPipeline {
     pub fn new(repo: String, voyage: Option<VoyageClient>) -> Self {
-        Self::new_with_concurrency(repo, voyage, 4)
+        Self::new_with_concurrency(repo, voyage, 4, None)
     }
 
-    pub fn new_with_concurrency(repo: String, voyage: Option<VoyageClient>, embed_concurrency: usize) -> Self {
+    pub fn new_with_concurrency(repo: String, voyage: Option<VoyageClient>, embed_concurrency: usize, cache: Option<EmbeddingCache>) -> Self {
         let embed_concurrency = embed_concurrency.max(1);
-        Self { repo, voyage, embed_concurrency }
+        Self { repo, voyage, embed_concurrency, cache: cache.map(Arc::new) }
     }
 
     /// Run the pipeline against the shared `db` handle.
@@ -165,6 +168,10 @@ impl IndexPipeline {
                 crate::indexing::tracker::detect_changes(&all_files, &meta_map)
             }
         };
+
+        // Filter out Added/Modified changes whose paths are inside dot-prefixed directories.
+        // Deleted changes are allowed through to clean up any previously indexed dot-dir entries.
+        let file_changes = filter_hidden_changes(std::path::Path::new(&self.repo), file_changes);
 
         if file_changes.is_empty() {
             debug!(repo = %self.repo, "no changes detected");
@@ -330,6 +337,7 @@ impl IndexPipeline {
 
         let voyage = self.voyage.clone();
         let embed_concurrency = self.embed_concurrency;
+        let cache_arc = self.cache.clone();
 
         // ── Stage 1: parallel parse (rayon), feed into bounded channel ────
         let (parse_tx, parse_rx) = mpsc::channel::<ParsedFile>(PARSE_CHANNEL_CAP);
@@ -364,6 +372,7 @@ impl IndexPipeline {
             let done_counter_clone = done_counter.clone();
             let embed_tx_clone = embed_tx.clone();
             let progress_clone = progress.cloned();
+            let cache_clone = cache_arc.clone();
 
             tokio::spawn(async move {
                 // Convert mpsc receiver to a stream.
@@ -374,10 +383,11 @@ impl IndexPipeline {
                 stream
                     .map(|pf| {
                         let voyage_ref = voyage_clone.clone();
+                        let cache_ref = cache_clone.clone();
                         let done_ref = done_counter_clone.clone();
                         let progress_ref = progress_clone.clone();
                         async move {
-                            let embeddings = embed_parsed_file(&pf, voyage_ref.as_ref()).await;
+                            let embeddings = embed_parsed_file(&pf, voyage_ref.as_ref(), cache_ref.as_deref()).await;
                             let done = done_ref.fetch_add(1, Ordering::Relaxed) + 1;
                             if let Some(ph) = &progress_ref {
                                 ph.set_processed(done).await;
@@ -987,6 +997,7 @@ fn parse_one_file(file: &str) -> Option<ParsedFile> {
 async fn embed_parsed_file(
     pf: &ParsedFile,
     voyage: Option<&VoyageClient>,
+    cache: Option<&EmbeddingCache>,
 ) -> Vec<Vec<f32>> {
     if pf.chunks.is_empty() {
         return vec![];
@@ -994,18 +1005,189 @@ async fn embed_parsed_file(
 
     let texts: Vec<String> = pf.chunks.iter().map(|c| c.content.clone()).collect();
 
-    match voyage {
-        Some(client) => {
-            // embed() internally batches at MAX_BATCH_SIZE.
-            match client.embed(&texts, InputType::Document).await {
-                Ok(embs) => embs,
-                Err(e) => {
-                    warn!(file = %pf.path, error = %e, "embed failed; storing empty embeddings");
-                    vec![vec![]; texts.len()]
+    // No voyage client AND no cache → return empty embeddings (same as before).
+    if voyage.is_none() && cache.is_none() {
+        return vec![vec![]; texts.len()];
+    }
+
+    match cache {
+        Some(cache) => {
+            // --- Cache path ---
+            let (raw_hits, miss_indices) = cache.get_many(&texts);
+
+            if miss_indices.is_empty() && !raw_hits.is_empty() {
+                // 100% cache hit path.
+                let dim = raw_hits[0].1.len();
+
+                // Partition into valid hits and dim-mismatches.
+                let mut valid_hits: Vec<(usize, Vec<f32>)> = Vec::new();
+                let mut dim_miss_indices: Vec<usize> = Vec::new();
+                for (idx, emb) in raw_hits {
+                    if emb.len() == dim {
+                        valid_hits.push((idx, emb));
+                    } else {
+                        dim_miss_indices.push(idx);
+                    }
                 }
+
+                // Re-embed dim-mismatched entries if any.
+                let mut extra_embeddings: Vec<(usize, Vec<f32>)> = Vec::new();
+                if !dim_miss_indices.is_empty() {
+                    if let Some(client) = voyage {
+                        let miss_texts: Vec<String> = dim_miss_indices
+                            .iter()
+                            .map(|&i| texts[i].clone())
+                            .collect();
+                        match client.embed(&miss_texts, InputType::Document).await {
+                            Ok(api_results) => {
+                                let put_texts: Vec<String> = dim_miss_indices
+                                    .iter()
+                                    .map(|&i| texts[i].clone())
+                                    .collect();
+                                cache.put_many(&put_texts, &api_results);
+                                for (local_i, emb) in api_results.into_iter().enumerate() {
+                                    extra_embeddings.push((dim_miss_indices[local_i], emb));
+                                }
+                            }
+                            Err(e) => {
+                                warn!(file = %pf.path, error = %e, "embed failed for dim-mismatched entries; storing empty");
+                                for &i in &dim_miss_indices {
+                                    extra_embeddings.push((i, vec![]));
+                                }
+                            }
+                        }
+                    } else {
+                        for &i in &dim_miss_indices {
+                            extra_embeddings.push((i, vec![]));
+                        }
+                    }
+                }
+
+                // Assemble final result in original order.
+                let mut result = vec![vec![]; texts.len()];
+                for (idx, emb) in valid_hits {
+                    result[idx] = emb;
+                }
+                for (idx, emb) in extra_embeddings {
+                    result[idx] = emb;
+                }
+                result
+            } else {
+                // Partial or total cache miss path.
+                let mut result = vec![vec![]; texts.len()];
+
+                // Place valid cache hits into result.
+                let mut valid_hits: Vec<(usize, Vec<f32>)> = Vec::new();
+
+                // We need to know dim to validate hits — will learn from API response.
+                // Collect all hits for now; validate after API call.
+                let tentative_hits = raw_hits; // (idx, embedding)
+
+                let all_miss_indices = if miss_indices.is_empty() {
+                    // raw_hits also empty — full miss.
+                    (0..texts.len()).collect::<Vec<_>>()
+                } else {
+                    miss_indices
+                };
+
+                // Call API for miss texts.
+                let api_embeddings: Option<Vec<Vec<f32>>> = if let Some(client) = voyage {
+                    let miss_texts: Vec<String> = all_miss_indices
+                        .iter()
+                        .map(|&i| texts[i].clone())
+                        .collect();
+                    match client.embed(&miss_texts, InputType::Document).await {
+                        Ok(embs) => Some(embs),
+                        Err(e) => {
+                            warn!(file = %pf.path, error = %e, "embed failed; storing empty embeddings");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                match api_embeddings {
+                    Some(api_results) if !api_results.is_empty() => {
+                        // Learn dim from API results.
+                        let dim = api_results[0].len();
+
+                        // Cache the API results.
+                        let miss_texts: Vec<String> = all_miss_indices
+                            .iter()
+                            .map(|&i| texts[i].clone())
+                            .collect();
+                        cache.put_many(&miss_texts, &api_results);
+
+                        // Place API results into result.
+                        for (local_i, emb) in api_results.into_iter().enumerate() {
+                            result[all_miss_indices[local_i]] = emb;
+                        }
+
+                        // Validate cache hits against dim.
+                        let mut re_embed_indices: Vec<usize> = Vec::new();
+                        for (idx, emb) in tentative_hits {
+                            if emb.len() == dim {
+                                valid_hits.push((idx, emb));
+                            } else {
+                                re_embed_indices.push(idx);
+                            }
+                        }
+
+                        // Re-embed any hits that were the wrong dim.
+                        if !re_embed_indices.is_empty()
+                            && let Some(client) = voyage
+                        {
+                            let re_texts: Vec<String> = re_embed_indices
+                                .iter()
+                                .map(|&i| texts[i].clone())
+                                .collect();
+                            match client.embed(&re_texts, InputType::Document).await {
+                                Ok(re_results) => {
+                                    cache.put_many(&re_texts, &re_results);
+                                    for (local_i, emb) in re_results.into_iter().enumerate() {
+                                        result[re_embed_indices[local_i]] = emb;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(file = %pf.path, error = %e, "re-embed failed for dim-mismatched hits; storing empty");
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // API failed or no voyage client — place empty for misses.
+                        for &i in &all_miss_indices {
+                            result[i] = vec![];
+                        }
+                        // Accept cache hits as-is (may be wrong dim but no API to fix them).
+                        valid_hits = tentative_hits;
+                    }
+                }
+
+                // Place valid cache hits.
+                for (idx, emb) in valid_hits {
+                    result[idx] = emb;
+                }
+
+                result
             }
         }
-        None => vec![vec![]; texts.len()],
+        None => {
+            // No cache — existing behavior.
+            match voyage {
+                Some(client) => {
+                    match client.embed(&texts, InputType::Document).await {
+                        Ok(embs) => embs,
+                        Err(e) => {
+                            warn!(file = %pf.path, error = %e, "embed failed; storing empty embeddings");
+                            vec![vec![]; texts.len()]
+                        }
+                    }
+                }
+                None => vec![vec![]; texts.len()],
+            }
+        }
     }
 }
 
@@ -1167,6 +1349,27 @@ async fn flush_edge_batch(
         .context("flush_edge_batch: RELATE statements")?;
 
     Ok(())
+}
+
+// ─── Hidden-directory change filter ──────────────────────────────────────
+
+/// Filter watcher-supplied file changes so that Added/Modified events for files
+/// inside dot-prefixed directories are never ingested.
+///
+/// Deleted changes are always allowed through — they clean up any stale entries
+/// that were indexed before this rule existed (self-healing behavior).
+pub(crate) fn filter_hidden_changes(repo: &std::path::Path, changes: Vec<FileChange>) -> Vec<FileChange> {
+    changes
+        .into_iter()
+        .filter(|c| {
+            // Always allow Deleted changes through (self-heal stale dot-dir entries).
+            if c.kind == ChangeKind::Deleted {
+                return true;
+            }
+            // Drop Added/Modified if the path is inside a dot-prefixed directory.
+            !is_under_hidden_dir(repo, std::path::Path::new(&c.path))
+        })
+        .collect()
 }
 
 // ─── SurrealQL escaping ───────────────────────────────────────────────────
@@ -2266,6 +2469,110 @@ mod incremental_phase2_tests {
         assert_eq!(
             final_calls.len(), 1,
             "must have exactly 1 calls edge; got {:?}", final_calls
+        );
+    }
+}
+
+// ─── Hidden-change filter tests ───────────────────────────────────────────
+#[cfg(test)]
+mod hidden_change_filter_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Verifies that filter_hidden_changes:
+    /// - drops Added/Modified changes whose paths are inside a dot-prefixed directory
+    /// - keeps Added/Modified for root-level dot-FILES (not directories)
+    /// - keeps Added/Modified for normal files
+    /// - always keeps Deleted changes, even when the path is inside a dot-dir
+    #[test]
+    fn filter_drops_dot_dir_modified_keeps_others() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Build real paths so strip_prefix works cross-platform.
+        let claude_dir = root.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let claude_file = claude_dir.join("agents.md");
+        std::fs::File::create(&claude_file).unwrap();
+
+        let claude_deleted = claude_dir.join("old.md");
+        // (does not need to exist on disk for Deleted)
+
+        let eslintrc = root.join(".eslintrc.json");
+        std::fs::File::create(&eslintrc).unwrap();
+
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src_main = src_dir.join("main.rs");
+        std::fs::File::create(&src_main).unwrap();
+
+        let changes = vec![
+            FileChange {
+                path: claude_file.to_str().unwrap().to_string(),
+                kind: ChangeKind::Modified,
+            },
+            FileChange {
+                path: eslintrc.to_str().unwrap().to_string(),
+                kind: ChangeKind::Modified,
+            },
+            FileChange {
+                path: src_main.to_str().unwrap().to_string(),
+                kind: ChangeKind::Modified,
+            },
+            FileChange {
+                path: claude_deleted.to_str().unwrap().to_string(),
+                kind: ChangeKind::Deleted,
+            },
+        ];
+
+        let filtered = filter_hidden_changes(root, changes);
+
+        // .claude/agents.md Modified must be dropped.
+        let has_claude_modified = filtered
+            .iter()
+            .any(|c| c.path.contains(".claude") && c.kind != ChangeKind::Deleted);
+        assert!(
+            !has_claude_modified,
+            ".claude/ Modified must be dropped; got: {:?}",
+            filtered.iter().map(|c| (&c.path, &c.kind)).collect::<Vec<_>>()
+        );
+
+        // .eslintrc.json Modified must survive (root-level dot-file).
+        let has_eslintrc = filtered
+            .iter()
+            .any(|c| c.path.ends_with(".eslintrc.json"));
+        assert!(
+            has_eslintrc,
+            ".eslintrc.json must survive filtering; got: {:?}",
+            filtered.iter().map(|c| (&c.path, &c.kind)).collect::<Vec<_>>()
+        );
+
+        // src/main.rs Modified must survive.
+        let has_src_main = filtered
+            .iter()
+            .any(|c| c.path.ends_with("main.rs") && c.kind != ChangeKind::Deleted);
+        assert!(
+            has_src_main,
+            "src/main.rs must survive filtering; got: {:?}",
+            filtered.iter().map(|c| (&c.path, &c.kind)).collect::<Vec<_>>()
+        );
+
+        // .claude/old.md Deleted must survive.
+        let has_claude_deleted = filtered
+            .iter()
+            .any(|c| c.path.contains(".claude") && c.kind == ChangeKind::Deleted);
+        assert!(
+            has_claude_deleted,
+            ".claude/old.md Deleted must survive (self-heal); got: {:?}",
+            filtered.iter().map(|c| (&c.path, &c.kind)).collect::<Vec<_>>()
+        );
+
+        // Total surviving: .eslintrc.json, src/main.rs, .claude/old.md Deleted = 3
+        assert_eq!(
+            filtered.len(),
+            3,
+            "expected 3 changes to survive; got: {:?}",
+            filtered.iter().map(|c| (&c.path, &c.kind)).collect::<Vec<_>>()
         );
     }
 }

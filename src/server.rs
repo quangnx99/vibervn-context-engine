@@ -6,7 +6,7 @@ use axum::{
     extract::{Json, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Router,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -141,6 +141,7 @@ pub fn build_router(
         .route("/api/index-status", get(get_index_status))
         .route("/api/query", post(post_query))
         .route("/api/mcp-tool", post(post_mcp_tool))
+        .route("/api/embedding-cache", delete(delete_embedding_cache))
         .merge(Router::new().nest_service("/mcp", mcp_service))
         .with_state(state)
 }
@@ -626,4 +627,39 @@ async fn post_mcp_tool(
     )
     .await;
     Json(json!({ "result": result })).into_response()
+}
+
+// ─── Embedding cache purge ────────────────────────────────────────────────
+
+/// DELETE /api/embedding-cache?older_than=all|30d
+///
+/// Purges embedding cache entries across all model subdirectories.
+/// `older_than=all` (default) deletes everything; `older_than=30d` deletes
+/// files not accessed in the last 30 days.
+async fn delete_embedding_cache(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let older_than = match params.get("older_than").map(|s| s.as_str()) {
+        Some("all") | None => None,
+        Some("30d") => Some(std::time::Duration::from_secs(30 * 24 * 3600)),
+        Some(other) => {
+            let body = json!({ "error": format!("invalid older_than value: {other}; use 'all' or '30d'") });
+            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+        }
+    };
+
+    let home_dir = state.home_dir.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::embedding::cache::EmbeddingCache::purge_global(&home_dir, older_than)
+    })
+    .await;
+
+    match result {
+        Ok(pr) => Json(json!({ "deleted": pr.deleted, "errors": pr.errors })).into_response(),
+        Err(e) => {
+            let body = json!({ "error": format!("purge task failed: {e}") });
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        }
+    }
 }

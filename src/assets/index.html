@@ -194,9 +194,27 @@
             Add
           </button>
         </form>
-      </section>
 
-      <!-- Section: LLM Keys -->
+        <!-- Embedding Cache -->
+        <div class="mt-6 pt-4 border-t border-gray-200 dark:border-wiki-border">
+          <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-2">Embedding Cache</label>
+          <div class="flex items-center gap-2">
+            <select id="cache-purge-scope"
+                    class="border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
+                           focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active">
+              <option value="all">All time</option>
+              <option value="30d">Older than 30 days</option>
+            </select>
+            <button id="btn-purge-cache"
+                    class="px-3 py-2 text-sm rounded border border-gray-300 dark:border-wiki-border text-gray-600 dark:text-wiki-text-muted
+                           hover:bg-gray-100 dark:hover:bg-wiki-surface hover:text-gray-900 dark:hover:text-wiki-text
+                           focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:opacity-50 disabled:cursor-not-allowed">
+              Clear Cache
+            </button>
+            <span id="cache-purge-status" class="text-xs text-gray-500 dark:text-wiki-text-muted"></span>
+          </div>
+        </div>
+      </section>
       <section>
         <h2 class="font-wiki text-xl dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-4">
           LLM Keys
@@ -947,6 +965,34 @@ document.getElementById('embedding-provider').addEventListener('change', (e) => 
 });
 document.getElementById('llm-provider').addEventListener('change', (e) => {
   if (cfg) { cfg.llm.provider = e.target.value; saveNow(); }
+});
+
+// ─── Embedding cache purge ─────────────────────────────────────────────────
+document.getElementById('btn-purge-cache').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-purge-cache');
+  const status = document.getElementById('cache-purge-status');
+  const scope = document.getElementById('cache-purge-scope').value;
+  btn.disabled = true;
+  btn.textContent = 'Clearing…';
+  status.textContent = '';
+  try {
+    const res = await fetch('/api/embedding-cache?older_than=' + encodeURIComponent(scope), { method: 'DELETE' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      status.textContent = data.error || 'Failed';
+      status.className = 'text-xs text-red-500 dark:text-red-400';
+    } else {
+      const data = await res.json();
+      status.textContent = 'Deleted ' + data.deleted.toLocaleString() + ' entries';
+      status.className = 'text-xs text-green-600 dark:text-green-400';
+    }
+  } catch (e) {
+    status.textContent = 'Network error';
+    status.className = 'text-xs text-red-500 dark:text-red-400';
+  }
+  btn.disabled = false;
+  btn.textContent = 'Clear Cache';
+  setTimeout(() => { status.textContent = ''; }, 5000);
 });
 
 // ─── Theme toggle ─────────────────────────────────────────────────────────
