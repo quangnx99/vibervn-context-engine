@@ -74,8 +74,9 @@ pub struct AppState {
     pub index_engine: Arc<IndexEngine>,
     /// Per-repo SurrealDB handles, keyed by repo path.
     pub repo_dbs: Arc<RwLock<HashMap<String, Surreal<Db>>>>,
-    /// Current settings (needed for VoyageClient creation at query time).
-    pub settings: Settings,
+    /// Shared live settings — the single source of truth.
+    /// All mutations go through this handle AND are written to disk first.
+    pub settings: Arc<RwLock<crate::config::Settings>>,
 }
 
 // ─── Router ────────────────────────────────────────────────────────────────
@@ -84,7 +85,7 @@ pub fn build_router(
     home_dir: PathBuf,
     index_engine: Arc<IndexEngine>,
     repo_dbs: Arc<RwLock<HashMap<String, Surreal<Db>>>>,
-    settings: Settings,
+    settings: Arc<RwLock<crate::config::Settings>>,
     bind_host: &str,
 ) -> Router {
     let state = AppState { home_dir: home_dir.clone(), index_engine: index_engine.clone(), repo_dbs: repo_dbs.clone(), settings: settings.clone() };
@@ -226,19 +227,52 @@ async fn put_config(
 
     let target = config_path(&state.home_dir);
 
-    match tokio::task::spawn_blocking(move || {
+    // (2) Persist to disk FIRST. Memory is only updated on success (step 3).
+    let saved = match tokio::task::spawn_blocking(move || {
         write_settings_atomic(&target, &settings)?;
         Ok::<Settings, ConfigError>(settings)
     })
     .await
     {
-        Ok(Ok(saved)) => Json(saved).into_response(),
-        Ok(Err(e)) => e.into_response(),
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return e.into_response(),
         Err(join_err) => {
             let body = json!({ "error": format!("internal error: {join_err}") });
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
+        }
+    };
+
+    // (3) Under a SINGLE write-lock critical section: diff the new repo list
+    // against the value we are about to replace, then swap in the new settings.
+    // Computing newly-added atomically against the replaced value (instead of a
+    // separate earlier read snapshot) closes the PUT/PUT race where two concurrent
+    // adds of the same repo could both trigger an initial index. The guard is
+    // dropped at the end of this block — it is NOT held across any await below.
+    let newly_added: Vec<String> = {
+        let mut guard = state.settings.write().await;
+        let added: Vec<String> = saved
+            .repos
+            .iter()
+            .filter(|r| !guard.repos.contains(*r))
+            .cloned()
+            .collect();
+        *guard = saved.clone();
+        added
+    };
+
+    // (4) Register + trigger each newly-added repo that is an existing directory.
+    // Runs on the locally-owned `newly_added` set — no settings guard is held here.
+    for repo in &newly_added {
+        if std::path::Path::new(repo).is_dir() {
+            state.index_engine.register_repo(repo).await;
+            if let Err(e) = state.index_engine.trigger_index(repo).await {
+                tracing::warn!(repo = %repo, error = %e, "put_config: trigger_index failed for new repo");
+            }
         }
     }
+
+    // (5) Return the saved settings JSON — same as before.
+    Json(saved).into_response()
 }
 
 /// POST /api/repos/:repo_id/index — trigger index for one repo.
@@ -281,22 +315,11 @@ async fn post_rebuild_repo(
 
 /// POST /api/index-all — trigger index for all repos.
 async fn post_index_all(State(state): State<AppState>) -> Response {
-    // Load current settings to get repo list.
-    let settings = match tokio::task::spawn_blocking({
-        let hd = state.home_dir.clone();
-        move || ensure_dir_and_load(&hd)
-    })
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return e.into_response(),
-        Err(e) => {
-            let body = json!({ "error": format!("internal error: {e}") });
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
-        }
-    };
+    // Read the current repo list from the shared live handle for single-source-of-truth
+    // consistency. Guard is dropped immediately after the clone — not held across awaits.
+    let repos = state.settings.read().await.repos.clone();
 
-    match state.index_engine.trigger_index_all(&settings.repos).await {
+    match state.index_engine.trigger_index_all(&repos).await {
         Ok(()) => (StatusCode::ACCEPTED, Json(json!({ "status": "accepted" }))).into_response(),
         Err(e) => {
             let body = json!({ "error": format!("failed to trigger index-all: {e}") });
@@ -366,12 +389,15 @@ async fn get_index_stats(
 
     let db_dir = store::db_path(&state.home_dir, &repo);
 
+    // Take an owned snapshot of only what's needed — guard dropped before the Json call.
+    let embedding_model = state.settings.read().await.embedding.model.clone();
+
     Json(json!({
         "repo": repo,
         "files": files,
         "chunks": chunks,
         "symbols": symbols,
-        "embedding_model": state.settings.embedding.model,
+        "embedding_model": embedding_model,
         "embedding_dim": embedding_dim,
         "db_path": db_dir.to_string_lossy(),
         "state": state_str,
@@ -506,8 +532,13 @@ async fn post_query(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
 ) -> Response {
+    // Take ONE owned snapshot of settings at the top of the handler.
+    // The guard is dropped as soon as `.clone()` completes — NOT held across any
+    // subsequent .await calls (vector_index.read(), query::run_query, etc.).
+    let settings = state.settings.read().await.clone();
+
     // Pre-flight checks.
-    if state.settings.repos.is_empty() {
+    if settings.repos.is_empty() {
         let body = json!({ "error": "No repositories configured. Add repos in Settings first." });
         return (StatusCode::BAD_REQUEST, Json(body)).into_response();
     }
@@ -520,15 +551,15 @@ async fn post_query(
         }
     }
 
-    if state.settings.embedding.api_keys.is_empty() {
+    if settings.embedding.api_keys.is_empty() {
         let body = json!({ "error": "No embedding API keys configured." });
         return (StatusCode::BAD_REQUEST, Json(body)).into_response();
     }
 
     // Build voyage client.
     let voyage_client = match VoyageClient::new(
-        state.settings.embedding.model.clone(),
-        state.settings.embedding.api_keys.clone(),
+        settings.embedding.model.clone(),
+        settings.embedding.api_keys.clone(),
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -539,7 +570,7 @@ async fn post_query(
 
     // Build LLM client for reranking (None if no keys configured or rerank disabled).
     let llm_client = if req.rerank {
-        LlmClient::new(&state.settings.llm)
+        LlmClient::new(&settings.llm)
     } else {
         None
     };
@@ -583,11 +614,13 @@ async fn post_mcp_tool(
     State(state): State<AppState>,
     Json(req): Json<McpToolRequest>,
 ) -> Response {
+    // Take an owned snapshot — guard dropped before the .await below.
+    let settings = state.settings.read().await.clone();
     let result = run_codebase_retrieval(
         &state.home_dir,
         &state.index_engine,
         &state.repo_dbs,
-        &state.settings,
+        &settings,
         &req.information_request,
         &req.workspace_full_path,
     )

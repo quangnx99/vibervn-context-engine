@@ -37,7 +37,7 @@ pub struct McpHandler {
     home_dir: PathBuf,
     index_engine: Arc<IndexEngine>,
     repo_dbs: Arc<RwLock<HashMap<String, Surreal<Db>>>>,
-    settings: Settings,
+    settings: Arc<RwLock<crate::config::Settings>>,
     // Required by the #[tool_router] macro; suppress the dead_code lint.
     #[allow(dead_code)]
     tool_router: ToolRouter<McpHandler>,
@@ -49,7 +49,7 @@ impl McpHandler {
         home_dir: PathBuf,
         index_engine: Arc<IndexEngine>,
         repo_dbs: Arc<RwLock<HashMap<String, Surreal<Db>>>>,
-        settings: Settings,
+        settings: Arc<RwLock<crate::config::Settings>>,
     ) -> Self {
         Self {
             home_dir,
@@ -91,11 +91,13 @@ Parameters:
         &self,
         Parameters(args): Parameters<CodebaseRetrievalArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Take an owned snapshot of settings — the guard is dropped before the .await below.
+        let settings = self.settings.read().await.clone();
         let text = run_codebase_retrieval(
             &self.home_dir,
             &self.index_engine,
             &self.repo_dbs,
-            &self.settings,
+            &settings,
             &args.information_request,
             &args.workspace_full_path,
         )

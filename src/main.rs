@@ -58,15 +58,31 @@ async fn main() {
         }
     };
 
+    // Wrap the loaded settings in a shared live handle so IndexEngine and the
+    // HTTP server share a single source of truth that mutates on every PUT /api/config.
+    let settings_handle = Arc::new(RwLock::new(settings));
+
     // Shared per-repo DB map — starts empty; `get_or_open` populates lazily.
     // The eager open loop has been removed: SurrealDB handles are expensive to
     // open and the consumer + query paths already cache them via `get_or_open`.
     let repo_dbs: store::RepoDbMap = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
+    // Take one owned boot snapshot — the read guard drops at the end of this
+    // statement, so it is NOT held across the IndexEngine::start(...).await below.
+    let boot_settings = settings_handle.read().await.clone();
+    let repo_count = boot_settings.repos.len();
+
     // Start IndexEngine — spawns watchers for all configured repos.
     // It shares `repo_dbs` so indexer writes land in the handles the server reads.
-    let index_engine = IndexEngine::start(home_dir.clone(), &settings, repo_dbs.clone()).await;
-    info!("IndexEngine started ({} repos)", settings.repos.len());
+    // It receives the shared settings handle so the consumer picks up post-boot changes.
+    let index_engine = IndexEngine::start(
+        home_dir.clone(),
+        &boot_settings,
+        repo_dbs.clone(),
+        settings_handle.clone(),
+    )
+    .await;
+    info!("IndexEngine started ({} repos)", repo_count);
 
     let addr: std::net::SocketAddr = format!("{bind}:{port}")
         .parse()
@@ -75,7 +91,7 @@ async fn main() {
             std::process::exit(2);
         });
 
-    let app = server::build_router(home_dir, index_engine, repo_dbs, settings, &bind);
+    let app = server::build_router(home_dir, index_engine, repo_dbs, settings_handle, &bind);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

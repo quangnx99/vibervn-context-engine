@@ -155,7 +155,15 @@ impl IndexEngine {
     ///
     /// `repo_dbs` is the shared handle map (also held by the server); the
     /// indexer writes through these same handles so reads observe its commits.
-    pub async fn start(home_dir: PathBuf, settings: &Settings, repo_dbs: RepoDbMap) -> Arc<Self> {
+    /// `settings_handle` is the shared live settings source of truth; the consumer
+    /// task takes a fresh snapshot at the top of each trigger iteration so API keys
+    /// and other config added after boot are picked up on the next run.
+    pub async fn start(
+        home_dir: PathBuf,
+        settings: &Settings,
+        repo_dbs: RepoDbMap,
+        settings_handle: Arc<RwLock<Settings>>,
+    ) -> Arc<Self> {
         let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel::<IndexTrigger>(256);
 
         // Start with an empty index so the server can bind immediately. The full
@@ -220,11 +228,12 @@ impl IndexEngine {
             });
         }
 
-        // Spawn the single consumer task.
+        // Spawn the single consumer task — passes the SHARED handle so the consumer
+        // can take a fresh snapshot on each trigger (picks up post-boot config changes).
         let engine_clone = engine.clone();
-        let settings_clone = settings.clone();
+        let settings_handle_clone = settings_handle.clone();
         tokio::spawn(async move {
-            run_consumer(engine_clone, trigger_rx, settings_clone).await;
+            run_consumer(engine_clone, trigger_rx, settings_handle_clone).await;
         });
 
         engine
@@ -320,13 +329,18 @@ impl IndexEngine {
 async fn run_consumer(
     engine: Arc<IndexEngine>,
     mut rx: tokio::sync::mpsc::Receiver<IndexTrigger>,
-    settings: Settings,
+    settings_handle: Arc<RwLock<Settings>>,
 ) {
     while let Some(trigger) = rx.recv().await {
+        // Take a fresh owned snapshot at the top of each iteration so post-boot
+        // changes to API keys and other config are reflected immediately.
+        // The guard is dropped as soon as `.clone()` completes — it is NOT held
+        // across any of the subsequent .await calls below.
+        let settings_ref = settings_handle.read().await.clone();
+
         let repo = trigger.repo.clone();
         let force_rebuild = trigger.rebuild;
         let engine_ref = engine.clone();
-        let settings_ref = settings.clone();
 
         // Acquire per-repo serialisation lock.
         let lock = engine_ref.get_repo_lock(&repo).await;
