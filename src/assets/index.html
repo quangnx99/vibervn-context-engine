@@ -170,6 +170,15 @@
                         placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
                         focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
         </div>
+        <div class="mb-4">
+          <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="embedding-concurrency">
+            Concurrent batches per key
+          </label>
+          <input id="embedding-concurrency" type="number" min="1" placeholder="16"
+                 class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
+                        placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                        focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+        </div>
         <div class="mb-2">
           <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1">API keys</label>
           <div id="embedding-keys-list" class="space-y-2 mb-2"></div>
@@ -792,6 +801,7 @@ function renderAll() {
   renderRepos();
   document.getElementById('embedding-provider').value = cfg.embedding.provider || 'voyage';
   document.getElementById('embedding-model').value = cfg.embedding.model || '';
+  document.getElementById('embedding-concurrency').value = cfg.embedding.embed_concurrency ?? 16;
   renderKeyList('embedding-keys-list', cfg.embedding.api_keys, (idx) => {
     cfg.embedding.api_keys.splice(idx, 1);
     renderAll();
@@ -922,6 +932,12 @@ document.getElementById('input-llm-key').addEventListener('keydown', (e) => {
 
 document.getElementById('embedding-model').addEventListener('input', (e) => {
   if (cfg) { cfg.embedding.model = e.target.value; saveDebounced(); }
+});
+document.getElementById('embedding-concurrency').addEventListener('input', (e) => {
+  if (!cfg) return;
+  const n = parseInt(e.target.value, 10);
+  cfg.embedding.embed_concurrency = (Number.isInteger(n) && n > 0) ? n : 16;
+  saveDebounced();
 });
 document.getElementById('llm-rerank-model').addEventListener('input', (e) => {
   if (cfg) { cfg.llm.rerank_model = e.target.value; saveDebounced(); }

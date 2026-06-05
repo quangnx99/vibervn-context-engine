@@ -399,10 +399,10 @@ async fn run_consumer(
         };
 
         let pipeline = {
-            // embed_concurrency = max(configured, api_keys.len() * 4).
+            // total in-flight batches = per-key concurrency × number of keys.
             let n_keys = settings_ref.embedding.api_keys.len().max(1);
             let configured = settings_ref.embedding.embed_concurrency;
-            let embed_concurrency = configured.max(n_keys * 4);
+            let embed_concurrency = configured * n_keys;
             IndexPipeline::new_with_concurrency(repo.clone(), voyage_client, embed_concurrency)
         };
 

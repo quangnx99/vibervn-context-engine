@@ -22,10 +22,10 @@ pub const MIGRATIONS: &[MigrationFn] = &[];
 // ─── Settings ──────────────────────────────────────────────────────────────
 
 fn default_embed_concurrency() -> usize {
-    // Default: 1 API key × 4 concurrent batches. Callers that have multiple
-    // keys set this to api_keys.len() * 4 at runtime when not explicitly
-    // configured. This field lets users override via CORBELL_EMBED_CONCURRENCY.
-    4
+    // Per-key concurrency: each API key is allowed this many concurrent
+    // embedding batches in-flight. Runtime total = this value × number of
+    // keys. Default 16. Override via CORBELL_EMBED_CONCURRENCY env var.
+    16
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -33,9 +33,9 @@ pub struct EmbeddingConfig {
     pub provider: String,
     pub model: String,
     pub api_keys: Vec<String>,
-    /// Maximum number of embedding batches in-flight concurrently.
-    /// Defaults to 4 (or api_keys.len() × 4 when computed at runtime).
-    /// Override via CORBELL_EMBED_CONCURRENCY env var (via Settings reload).
+    /// Per-key concurrency: number of embedding batches in-flight per API key.
+    /// Runtime total in-flight batches = embed_concurrency × api_keys.len().
+    /// Defaults to 16. Override via CORBELL_EMBED_CONCURRENCY env var.
     #[serde(default = "default_embed_concurrency")]
     pub embed_concurrency: usize,
 }
