@@ -459,6 +459,8 @@ pub async fn find_symbols_by_names(
 /// Symbol with positional info, for tie-break sorting in two-phase edge resolution.
 #[derive(Debug, Clone)]
 pub struct SymbolWithPos {
+    /// Full FQN from `meta::id(id)` — used as the RELATE endpoint in Phase 2.
+    pub fqn: String,
     pub file: String,
     pub name: String,
     pub line_start: i64,
@@ -476,6 +478,7 @@ pub async fn find_symbols_by_names_with_pos(
 
     #[derive(Deserialize)]
     struct Row {
+        fqn: String,
         file: String,
         name: String,
         line_start: i64,
@@ -483,7 +486,7 @@ pub async fn find_symbols_by_names_with_pos(
     }
 
     let rows: Vec<Row> = db
-        .query("SELECT file, name, line_start, line_end FROM symbol WHERE name IN $names")
+        .query("SELECT meta::id(id) AS fqn, file, name, line_start, line_end FROM symbol WHERE name IN $names")
         .bind(("names", names.to_vec()))
         .await
         .context("find_symbols_by_names_with_pos")?
@@ -492,6 +495,10 @@ pub async fn find_symbols_by_names_with_pos(
     Ok(rows
         .into_iter()
         .map(|r| SymbolWithPos {
+            // meta::id(id) returns the ID portion with wrapping ⟨…⟩ for complex IDs
+            // (e.g. "⟨/foo.rs::bar⟩"). Strip those brackets to recover the plain FQN
+            // that was passed to QualifiedSymbol::fqn() at upsert time.
+            fqn: strip_id_brackets(&r.fqn),
             file: r.file,
             name: r.name,
             line_start: r.line_start,
@@ -698,21 +705,19 @@ pub async fn call_graph(
     edge_limit: usize,
     node_limit: usize,
 ) -> Result<CallGraph> {
-    // Symbol endpoints are stored as record links; fetch FQN + metadata via the
-    // relation's in/out, plus the file fields already denormalized on the edge.
+    // Symbol endpoints: in_name and out_name now store full FQNs (file::scope::name),
+    // matching the node IDs produced by meta::id(id) below.
     #[derive(Deserialize)]
     struct EdgeRow {
         #[serde(rename = "in_name")]
         in_name: Option<String>,
         #[serde(rename = "out_name")]
         out_name: Option<String>,
-        in_file: String,
-        out_file: String,
     }
 
     let edge_rows: Vec<EdgeRow> = db
         .query(
-            "SELECT in.name AS in_name, out.name AS out_name, in_file, out_file \
+            "SELECT in_name, out_name \
              FROM calls LIMIT $limit",
         )
         .bind(("limit", edge_limit as i64))
@@ -722,9 +727,10 @@ pub async fn call_graph(
 
     let total_edges = edge_rows.len();
 
-    // Pull symbol metadata for nodes (bounded). Keyed by file::name.
+    // Pull symbol metadata for nodes (bounded). Keyed by FQN from meta::id.
     #[derive(Deserialize)]
     struct SymRow {
+        fqn: String,
         name: String,
         kind: String,
         file: String,
@@ -733,7 +739,7 @@ pub async fn call_graph(
     }
     let sym_rows: Vec<SymRow> = db
         .query(
-            "SELECT name, kind, file, line_start, line_end FROM symbol LIMIT $limit",
+            "SELECT meta::id(id) AS fqn, name, kind, file, line_start, line_end FROM symbol LIMIT $limit",
         )
         .bind(("limit", node_limit as i64))
         .await
@@ -743,7 +749,8 @@ pub async fn call_graph(
     let mut nodes: Vec<GraphNode> = Vec::with_capacity(sym_rows.len());
     let mut node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in sym_rows {
-        let id = format!("{}::{}", s.file, s.name);
+        // meta::id(id) wraps complex IDs in ⟨…⟩ — strip them to get the plain FQN.
+        let id = strip_id_brackets(&s.fqn);
         if node_ids.insert(id.clone()) {
             nodes.push(GraphNode {
                 id,
@@ -762,8 +769,9 @@ pub async fn call_graph(
             (Some(i), Some(o)) => (i, o),
             _ => continue,
         };
-        let source = format!("{}::{}", e.in_file, in_name);
-        let target = format!("{}::{}", e.out_file, out_name);
+        // in_name and out_name now store full FQNs, matching node_ids keyed by FQN.
+        let source = in_name;
+        let target = out_name;
         if node_ids.contains(&source) && node_ids.contains(&target) {
             edges.push(GraphEdge { source, target });
         }
@@ -778,6 +786,19 @@ fn strip_symbol_ref(s: &str) -> Option<String> {
     s.strip_prefix("symbol:⟨")
         .and_then(|s| s.strip_suffix("⟩"))
         .map(|fqn| fqn.rsplit("::").next().unwrap_or(fqn).to_string())
+}
+
+/// Strip the SurrealDB complex-ID wrapper `⟨…⟩` returned by `meta::id(id)`.
+///
+/// SurrealDB encodes record IDs that contain non-standard characters by wrapping
+/// them in `⟨` / `⟩` angle brackets. When projected with `meta::id(id) AS fqn`,
+/// a record whose ID is `symbol:⟨/foo.rs::bar⟩` returns `fqn = "⟨/foo.rs::bar⟩"`.
+/// This helper strips those brackets to recover the plain FQN string.
+fn strip_id_brackets(id: &str) -> String {
+    id.strip_prefix("⟨")
+        .and_then(|s| s.strip_suffix("⟩"))
+        .unwrap_or(id)
+        .to_string()
 }
 
 // ─── STEP 1 proof test ────────────────────────────────────────────────────

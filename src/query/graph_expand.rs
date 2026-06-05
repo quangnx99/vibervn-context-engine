@@ -180,69 +180,74 @@ async fn query_overlapping_symbols(
 
 /// Query callers of the symbol identified by `fqn`.
 ///
-/// Version gate:
-///   - schema_version >= 2: uses indexed `WHERE out_name = $name` (fast).
-///   - schema_version < 2: uses link-deref `WHERE out.name = $name` (correct but unindexed).
+/// Uses indexed `in_name`/`out_name` columns which now store full FQNs.
+/// The `schema_version` parameter is retained for API compatibility but
+/// the v1 link-deref fallback is no longer accurate since in_name/out_name
+/// now store FQNs (v2+ schema). For v1 DBs the fallback path is kept
+/// for graceful degradation.
 async fn query_callers(db: &Surreal<Db>, fqn: &str, schema_version: u32) -> Result<Vec<String>> {
-    let name = fqn.rsplit("::").next().unwrap_or(fqn);
-
     #[derive(Deserialize)]
     struct Row {
-        in_file: String,
+        in_name: String,
     }
 
     let rows: Vec<Row> = if schema_version >= 2 {
-        // Fast path: indexed column added in v2.
-        db.query("SELECT in_file FROM calls WHERE out_name = $name LIMIT 20")
-            .bind(("name", name.to_string()))
+        // Fast path: query by full FQN — in_name now stores FQN, indexed by idx_calls_in_name.
+        db.query("SELECT in_name FROM calls WHERE out_name = $fqn LIMIT 20")
+            .bind(("fqn", fqn.to_string()))
             .await?
             .take(0)?
     } else {
-        // Slow path: link-deref (correct on all rows, just unindexed).
-        db.query("SELECT in_file FROM calls WHERE out.name = $name LIMIT 20")
+        // Slow fallback for v1 DBs (link-deref on the `in` record).
+        let name = fqn.rsplit("::").next().unwrap_or(fqn);
+        #[derive(Deserialize)]
+        struct V1Row { in_file: String }
+        let v1_rows: Vec<V1Row> = db
+            .query("SELECT in_file FROM calls WHERE out.name = $name LIMIT 20")
             .bind(("name", name.to_string()))
             .await?
-            .take(0)?
+            .take(0)?;
+        return Ok(v1_rows.into_iter().map(|r| format!("{}::{}", r.in_file, name)).collect());
     };
 
     let callers: Vec<String> = rows
         .into_iter()
-        .map(|r| format!("{}::{}", r.in_file, name))
+        .map(|r| r.in_name)
         .collect();
     Ok(callers)
 }
 
 /// Query callees of the symbol identified by `fqn`.
 ///
-/// Version gate: same as `query_callers`.
+/// Uses indexed `in_name`/`out_name` columns which now store full FQNs.
 async fn query_callees(db: &Surreal<Db>, fqn: &str, schema_version: u32) -> Result<Vec<String>> {
-    let name = fqn.rsplit("::").next().unwrap_or(fqn);
-
     #[derive(Deserialize)]
     struct Row {
-        out_file: String,
+        out_name: String,
     }
 
     let rows: Vec<Row> = if schema_version >= 2 {
-        // Fast path: indexed column added in v2.
-        db.query("SELECT out_file FROM calls WHERE in_name = $name LIMIT 20")
-            .bind(("name", name.to_string()))
+        // Fast path: query by full FQN — out_name now stores FQN, indexed by idx_calls_out_name.
+        db.query("SELECT out_name FROM calls WHERE in_name = $fqn LIMIT 20")
+            .bind(("fqn", fqn.to_string()))
             .await?
             .take(0)?
     } else {
-        // Slow path: link-deref (correct on all rows).
-        db.query("SELECT out_file FROM calls WHERE in.name = $name LIMIT 20")
+        // Slow fallback for v1 DBs (link-deref on the `out` record).
+        let name = fqn.rsplit("::").next().unwrap_or(fqn);
+        #[derive(Deserialize)]
+        struct V1Row { out_file: String }
+        let v1_rows: Vec<V1Row> = db
+            .query("SELECT out_file FROM calls WHERE in.name = $name LIMIT 20")
             .bind(("name", name.to_string()))
             .await?
-            .take(0)?
+            .take(0)?;
+        return Ok(v1_rows.into_iter().map(|r| format!("{}::{}", r.out_file, name)).collect());
     };
 
     let callees: Vec<String> = rows
         .into_iter()
-        .map(|r| {
-            let callee_name = fqn.rsplit("::").next().unwrap_or(name);
-            format!("{}::{}", r.out_file, callee_name)
-        })
+        .map(|r| r.out_name)
         .collect();
     Ok(callees)
 }

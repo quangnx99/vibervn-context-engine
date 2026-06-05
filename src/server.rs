@@ -130,7 +130,7 @@ pub fn build_router(
         .route("/", get(serve_index))
         .route("/api/config", get(get_config))
         .route("/api/config", put(put_config))
-        .route("/api/repos/:repo_id/index", post(post_index_repo))
+        .route("/api/repos/:repo_id/index", post(post_index_repo).delete(delete_repo_index))
         .route("/api/repos/:repo_id/rebuild", post(post_rebuild_repo))
         .route("/api/repos/:repo_id/status", get(get_repo_status))
         .route("/api/repos/:repo_id/index-stats", get(get_index_stats))
@@ -309,6 +309,40 @@ async fn post_rebuild_repo(
         Ok(()) => (StatusCode::ACCEPTED, Json(json!({ "status": "accepted" }))).into_response(),
         Err(e) => {
             let body = json!({ "error": format!("failed to trigger rebuild: {e}") });
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        }
+    }
+}
+
+/// DELETE /api/repos/:repo_id/index — remove the index DB folder for a repo.
+async fn delete_repo_index(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+) -> Response {
+    let repo = match decode_repo_id(&repo_id) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+
+    // Close the DB handle if it's open so the directory can be removed.
+    {
+        let mut map = state.repo_dbs.write().await;
+        map.remove(&repo);
+    }
+
+    let db_dir = store::db_path(&state.home_dir, &repo);
+    if !db_dir.exists() {
+        return Json(json!({ "status": "ok", "message": "no index to remove" })).into_response();
+    }
+
+    match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&db_dir)).await {
+        Ok(Ok(())) => Json(json!({ "status": "ok" })).into_response(),
+        Ok(Err(e)) => {
+            let body = json!({ "error": format!("failed to remove index directory: {e}") });
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        }
+        Err(e) => {
+            let body = json!({ "error": format!("internal error: {e}") });
             (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
         }
     }

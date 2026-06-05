@@ -86,6 +86,7 @@ DEFINE INDEX IF NOT EXISTS idx_meta_key ON index_meta FIELDS key UNIQUE;
 DEFINE TABLE IF NOT EXISTS raw_edge SCHEMAFULL;
 DEFINE FIELD OVERWRITE from_file    ON raw_edge TYPE string;
 DEFINE FIELD OVERWRITE from_name    ON raw_edge TYPE string;
+DEFINE FIELD OVERWRITE from_fqn     ON raw_edge TYPE string;
 DEFINE FIELD OVERWRITE to_name      ON raw_edge TYPE string;
 DEFINE FIELD OVERWRITE kind         ON raw_edge TYPE string;
 DEFINE FIELD OVERWRITE line         ON raw_edge TYPE int;

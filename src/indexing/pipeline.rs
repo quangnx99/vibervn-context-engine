@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
 use tokio::sync::mpsc;
@@ -70,6 +70,9 @@ struct SymbolRecord {
 struct RawEdgeRecord {
     from_file: String,
     from_name: String,
+    /// Full FQN of the calling symbol (file::scope1::...::name). Stored at parse time
+    /// so Phase 2 can use it directly as the RELATE source without re-constructing it.
+    from_fqn: String,
     to_name: String,
     kind: String,
     line: i64,
@@ -104,6 +107,95 @@ pub struct IndexPipelineStats {
 
 /// Key used to track whether Phase 2 (raw edge resolution) has completed.
 const EDGES_RESOLVED_KEY: &str = "edges_resolved";
+
+/// A row fetched from `raw_edge` during Phase 2 edge resolution.
+/// Shared by both full-build and incremental Phase 2 paths.
+#[derive(Deserialize)]
+struct RawEdgeRow {
+    id_str: String,
+    from_file: String,
+    #[allow(dead_code)]
+    from_name: String,
+    from_fqn: String,
+    to_name: String,
+    #[allow(dead_code)]
+    kind: String,
+    line: i64,
+    import_path: Option<String>,
+}
+
+/// Resolve a page of raw edges into the edge accumulator.
+///
+/// Shared logic for both full-build and incremental Phase 2:
+/// 1. Collect unique callee names from the batch
+/// 2. Batch-lookup symbols by name (returns FQN via meta::id)
+/// 3. Bucket by leaf name, sort deterministically
+/// 4. For each raw edge, select best candidate and push resolved edge
+/// 5. Flush to DB when accumulator reaches WRITE_BATCH_SIZE
+async fn resolve_raw_edge_page(
+    db: &Surreal<Db>,
+    batch: &[RawEdgeRow],
+    edge_batch: &mut Vec<(String, String, i64, String, String, String, String)>,
+    label: &str,
+) -> Result<()> {
+    let to_names: Vec<String> = {
+        let mut names: Vec<String> = batch.iter().map(|r| r.to_name.clone()).collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    };
+
+    let sym_rows = find_symbols_by_names_with_pos(db, &to_names).await?;
+
+    let mut name_bucket: HashMap<String, Vec<SymbolWithPos>> = HashMap::new();
+    for s in sym_rows {
+        name_bucket.entry(s.name.clone()).or_default().push(s);
+    }
+    for bucket in name_bucket.values_mut() {
+        bucket.sort_unstable_by(|a, b| {
+            a.file.cmp(&b.file)
+                .then(a.line_start.cmp(&b.line_start))
+                .then(a.line_end.cmp(&b.line_end))
+        });
+    }
+
+    for row in batch {
+        let resolved_to = match name_bucket.get(&row.to_name) {
+            Some(candidates) if !candidates.is_empty() => {
+                IndexPipeline::select_best_candidate(
+                    candidates,
+                    &row.from_file,
+                    row.import_path.as_deref(),
+                ).cloned()
+            }
+            _ => {
+                debug!(name = %row.to_name, "{}: dropping unresolved raw edge", label);
+                None
+            }
+        };
+
+        if let Some(to) = resolved_to {
+            edge_batch.push((
+                row.from_fqn.clone(),
+                to.fqn.clone(),
+                row.line,
+                row.from_file.clone(),
+                to.file.clone(),
+                row.from_fqn.clone(),
+                to.fqn.clone(),
+            ));
+
+            if edge_batch.len() >= WRITE_BATCH_SIZE {
+                flush_edge_batch(db, edge_batch)
+                    .await
+                    .context(format!("{}: flush edge batch", label))?;
+                edge_batch.clear();
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Runs the parse → embed → store pipeline for one repo.
 pub struct IndexPipeline {
@@ -468,7 +560,7 @@ impl IndexPipeline {
     ///
     /// Within each level, `.find()` on the pre-sorted bucket gives deterministic
     /// first-match. The bucket is pre-sorted by `(file, line_start, line_end)`.
-    fn select_best_candidate<'a>(
+    pub(crate) fn select_best_candidate<'a>(
         candidates: &'a [SymbolWithPos],
         from_file: &str,
         import_path: Option<&str>,
@@ -573,31 +665,16 @@ impl IndexPipeline {
         //     the cursor row itself, and the unique id guarantees no row is skipped or
         //     duplicated.
         //   - Sentinel: start with cursor = "" (empty string sorts before all real ids).
-        #[derive(Deserialize)]
-        struct RawEdgeRow {
-            id_str: String,
-            from_file: String,
-            from_name: String,
-            to_name: String,
-            #[allow(dead_code)]
-            kind: String,
-            line: i64,
-            import_path: Option<String>,
-        }
 
         let page_size: i64 = WRITE_BATCH_SIZE as i64;
-        // Sentinel: empty string sorts before all real SurrealDB record-id strings.
         let mut cursor = String::new();
-
-        // Accumulator for resolved edges awaiting batch flush.
-        // Each element: (from_fqn, to_fqn, line, in_file, out_file, in_name, out_name)
         let mut edge_batch: Vec<(String, String, i64, String, String, String, String)> = Vec::new();
 
         loop {
             let batch: Vec<RawEdgeRow> = db
                 .query(
                     "SELECT type::string(id) AS id_str, \
-                            from_file, from_name, to_name, kind, line, import_path \
+                            from_file, from_name, from_fqn, to_name, kind, line, import_path \
                      FROM raw_edge \
                      WHERE type::string(id) > $cursor \
                      ORDER BY id_str \
@@ -613,76 +690,13 @@ impl IndexPipeline {
                 break;
             }
 
-            // Advance cursor to the last id_str in this page.
-            // Safe: batch is non-empty and ordered by id_str.
             cursor = batch.last().map(|r| r.id_str.clone()).unwrap_or(cursor);
 
-            // Collect unique to_names for batch symbol lookup.
-            let to_names: Vec<String> = {
-                let mut names: Vec<String> = batch.iter().map(|r| r.to_name.clone()).collect();
-                names.sort_unstable();
-                names.dedup();
-                names
-            };
-
-            let sym_rows = find_symbols_by_names_with_pos(db, &to_names).await?;
-
-            // Bucket by name, sort each bucket deterministically by (file, line_start, line_end).
-            let mut name_bucket: HashMap<String, Vec<SymbolWithPos>> = HashMap::new();
-            for s in sym_rows {
-                name_bucket.entry(s.name.clone()).or_default().push(s);
-            }
-            for bucket in name_bucket.values_mut() {
-                bucket.sort_unstable_by(|a, b| {
-                    a.file.cmp(&b.file)
-                        .then(a.line_start.cmp(&b.line_start))
-                        .then(a.line_end.cmp(&b.line_end))
-                });
-            }
-
-            // Resolve each raw edge and accumulate into edge_batch.
-            for row in &batch {
-                let resolved_to = match name_bucket.get(&row.to_name) {
-                    Some(candidates) if !candidates.is_empty() => {
-                        // Use 4-level import-aware priority selection.
-                        Self::select_best_candidate(
-                            candidates,
-                            &row.from_file,
-                            row.import_path.as_deref(),
-                        ).cloned()
-                    }
-                    _ => {
-                        debug!(name = %row.to_name, "phase2: dropping unresolved raw edge");
-                        None
-                    }
-                };
-
-                if let Some(to) = resolved_to {
-                    let from_fqn = format!("{}::{}", row.from_file, row.from_name);
-                    let to_fqn = format!("{}::{}", to.file, to.name);
-                    edge_batch.push((
-                        from_fqn,
-                        to_fqn,
-                        row.line,
-                        row.from_file.clone(),
-                        to.file.clone(),
-                        row.from_name.clone(),
-                        to.name.clone(),
-                    ));
-
-                    // Flush when batch reaches WRITE_BATCH_SIZE.
-                    if edge_batch.len() >= WRITE_BATCH_SIZE {
-                        flush_edge_batch(db, &edge_batch)
-                            .await
-                            .context("phase2: flush edge batch")?;
-                        edge_batch.clear();
-                    }
-                }
-            }
+            resolve_raw_edge_page(db, &batch, &mut edge_batch, "phase2").await?;
 
             let batch_len = batch.len() as i64;
             if batch_len < page_size {
-                break; // Last page.
+                break;
             }
         }
 
@@ -763,9 +777,11 @@ impl IndexPipeline {
         // must include it in the resolve set even though it never pointed into the changed
         // file before.
         //
-        // Step: collect the symbol names now defined in the changed files (the ORIGINAL
+        // Step: collect the leaf names now defined in the changed files (the ORIGINAL
         // changed_files parameter, NOT the already-expanded resolve_set — we want names
         // that were added/changed, not the transitive set).
+        // We query by leaf `name` and look up raw_edge.to_name, which still stores the
+        // unresolved leaf callee name — this is correct for direction-2 expansion.
         #[derive(Deserialize)]
         struct SymbolNameRow { name: String }
         let new_symbol_rows: Vec<SymbolNameRow> = db
@@ -778,22 +794,24 @@ impl IndexPipeline {
         if !new_symbol_rows.is_empty() {
             let new_names: Vec<String> = new_symbol_rows.into_iter().map(|r| r.name).collect();
 
-            // Find callers that target any of those names but are NOT already in resolve_set.
-            // Uses idx_calls_out_name — bounded by edges targeting those names.
-            // We do the dedup in Rust after the query to avoid potential perf issues with
-            // large NOT IN sets.
+            // Find callers that target any of those names via raw_edge.to_name.
+            // raw_edge.to_name stores the unresolved leaf callee name, so this correctly
+            // finds any file that calls a symbol with the given leaf name — including files
+            // whose existing calls row points to a different definition (stale lex-first target).
+            // Uses idx_raw_edge_from_file for the GROUP BY; the to_name lookup is bounded
+            // by the number of edges with matching callee names.
             #[derive(Deserialize)]
-            struct InFileRow { in_file: String }
-            let name_exp_rows: Vec<InFileRow> = db
-                .query("SELECT in_file FROM calls WHERE out_name IN $names GROUP BY in_file")
+            struct FromFileRow { from_file: String }
+            let name_exp_rows: Vec<FromFileRow> = db
+                .query("SELECT from_file FROM raw_edge WHERE to_name IN $names GROUP BY from_file")
                 .bind(("names", new_names))
                 .await
-                .context("incremental phase2: name-based expansion")?
+                .context("incremental phase2: name-based expansion via raw_edge")?
                 .take(0)?;
 
             for row in name_exp_rows {
-                if !resolve_set.contains(&row.in_file) {
-                    resolve_set.push(row.in_file);
+                if !resolve_set.contains(&row.from_file) {
+                    resolve_set.push(row.from_file);
                 }
             }
         }
@@ -815,18 +833,6 @@ impl IndexPipeline {
         // Step 3: Re-resolve raw_edge rows whose from_file is in the resolve set.
         // Keyset-paginated with from_file filter — uses idx_raw_edge_from_file.
 
-        #[derive(Deserialize)]
-        struct RawEdgeRow {
-            id_str: String,
-            from_file: String,
-            from_name: String,
-            to_name: String,
-            #[allow(dead_code)]
-            kind: String,
-            line: i64,
-            import_path: Option<String>,
-        }
-
         let page_size: i64 = WRITE_BATCH_SIZE as i64;
         let mut cursor = String::new();
         let mut edge_batch: Vec<(String, String, i64, String, String, String, String)> = Vec::new();
@@ -835,7 +841,7 @@ impl IndexPipeline {
             let batch: Vec<RawEdgeRow> = db
                 .query(
                     "SELECT type::string(id) AS id_str, \
-                            from_file, from_name, to_name, kind, line, import_path \
+                            from_file, from_name, from_fqn, to_name, kind, line, import_path \
                      FROM raw_edge \
                      WHERE from_file IN $files \
                        AND type::string(id) > $cursor \
@@ -855,67 +861,7 @@ impl IndexPipeline {
 
             cursor = batch.last().map(|r| r.id_str.clone()).unwrap_or(cursor);
 
-            // Collect unique to_names for batch symbol lookup.
-            let to_names: Vec<String> = {
-                let mut names: Vec<String> = batch.iter().map(|r| r.to_name.clone()).collect();
-                names.sort_unstable();
-                names.dedup();
-                names
-            };
-
-            let sym_rows = find_symbols_by_names_with_pos(db, &to_names).await?;
-
-            // Bucket by name, sort each bucket deterministically by (file, line_start, line_end).
-            let mut name_bucket: HashMap<String, Vec<SymbolWithPos>> = HashMap::new();
-            for s in sym_rows {
-                name_bucket.entry(s.name.clone()).or_default().push(s);
-            }
-            for bucket in name_bucket.values_mut() {
-                bucket.sort_unstable_by(|a, b| {
-                    a.file.cmp(&b.file)
-                        .then(a.line_start.cmp(&b.line_start))
-                        .then(a.line_end.cmp(&b.line_end))
-                });
-            }
-
-            // Resolve each raw edge and accumulate into edge_batch.
-            for row in &batch {
-                let resolved_to = match name_bucket.get(&row.to_name) {
-                    Some(candidates) if !candidates.is_empty() => {
-                        // Use 4-level import-aware priority selection.
-                        Self::select_best_candidate(
-                            candidates,
-                            &row.from_file,
-                            row.import_path.as_deref(),
-                        ).cloned()
-                    }
-                    _ => {
-                        debug!(name = %row.to_name, "incremental phase2: dropping unresolved raw edge");
-                        None
-                    }
-                };
-
-                if let Some(to) = resolved_to {
-                    let from_fqn = format!("{}::{}", row.from_file, row.from_name);
-                    let to_fqn = format!("{}::{}", to.file, to.name);
-                    edge_batch.push((
-                        from_fqn,
-                        to_fqn,
-                        row.line,
-                        row.from_file.clone(),
-                        to.file.clone(),
-                        row.from_name.clone(),
-                        to.name.clone(),
-                    ));
-
-                    if edge_batch.len() >= WRITE_BATCH_SIZE {
-                        flush_edge_batch(db, &edge_batch)
-                            .await
-                            .context("incremental phase2: flush edge batch")?;
-                        edge_batch.clear();
-                    }
-                }
-            }
+            resolve_raw_edge_page(db, &batch, &mut edge_batch, "incremental phase2").await?;
 
             let batch_len = batch.len() as i64;
             if batch_len < page_size {
@@ -970,6 +916,7 @@ fn parse_one_file(file: &str) -> Option<ParsedFile> {
                 Some(RawEdgeRecord {
                     from_file: e.from.file.clone(),
                     from_name: e.from.name.clone(),
+                    from_fqn: e.from.fqn(),
                     to_name,
                     kind: "calls".to_string(),
                     line: e.line as i64,
@@ -1551,9 +1498,9 @@ mod resolution_tests {
     #[test]
     fn tie_break_sort_deterministic() {
         let mut candidates: Vec<SymbolWithPos> = vec![
-            SymbolWithPos { file: "/c.rs".to_string(), name: "f".to_string(), line_start: 10, line_end: 20 },
-            SymbolWithPos { file: "/a.rs".to_string(), name: "f".to_string(), line_start: 5, line_end: 15 },
-            SymbolWithPos { file: "/b.rs".to_string(), name: "f".to_string(), line_start: 1, line_end: 5 },
+            SymbolWithPos { fqn: "/c.rs::f".to_string(), file: "/c.rs".to_string(), name: "f".to_string(), line_start: 10, line_end: 20 },
+            SymbolWithPos { fqn: "/a.rs::f".to_string(), file: "/a.rs".to_string(), name: "f".to_string(), line_start: 5, line_end: 15 },
+            SymbolWithPos { fqn: "/b.rs::f".to_string(), file: "/b.rs".to_string(), name: "f".to_string(), line_start: 1, line_end: 5 },
         ];
 
         candidates.sort_unstable_by(|a, b| {
@@ -1573,8 +1520,8 @@ mod resolution_tests {
     fn same_file_preferred_over_sorted_first() {
         let from_file = "/b.rs";
         let candidates: Vec<SymbolWithPos> = vec![
-            SymbolWithPos { file: "/a.rs".to_string(), name: "f".to_string(), line_start: 1, line_end: 5 },
-            SymbolWithPos { file: "/b.rs".to_string(), name: "f".to_string(), line_start: 10, line_end: 20 },
+            SymbolWithPos { fqn: "/a.rs::f".to_string(), file: "/a.rs".to_string(), name: "f".to_string(), line_start: 1, line_end: 5 },
+            SymbolWithPos { fqn: "/b.rs::f".to_string(), file: "/b.rs".to_string(), name: "f".to_string(), line_start: 10, line_end: 20 },
         ];
 
         // Same-file candidate (/b.rs) should be preferred even though /a.rs sorts first.
@@ -1664,6 +1611,7 @@ mod keyset_pagination_tests {
         struct RawEdge {
             from_file: String,
             from_name: String,
+            from_fqn: String,
             to_name: String,
             kind: String,
             line: i64,
@@ -1676,9 +1624,12 @@ mod keyset_pagination_tests {
                 // kind of non-unique-on-content rows that caused OFFSET to potentially skip.
                 let from_file = if i % 5 == 1 { "/a.rs".to_string() } else { format!("/f{i}.rs") };
                 let to_name = if i % 5 == 1 { "foo".to_string() } else { format!("sym{i}") };
+                let from_name = format!("caller{i}");
+                let from_fqn = format!("{}::{}", from_file, from_name);
                 RawEdge {
                     from_file,
-                    from_name: format!("caller{i}"),
+                    from_name,
+                    from_fqn,
                     to_name,
                     kind: "calls".to_string(),
                     line: i,
@@ -1784,6 +1735,7 @@ mod keyset_pagination_tests {
         struct RawEdge {
             from_file: String,
             from_name: String,
+            from_fqn: String,
             to_name: String,
             kind: String,
             line: i64,
@@ -1794,6 +1746,7 @@ mod keyset_pagination_tests {
             .map(|i| RawEdge {
                 from_file: "/file_a.rs".to_string(),
                 from_name: format!("fn_a{i}"),
+                from_fqn: format!("/file_a.rs::fn_a{i}"),
                 to_name: format!("target{i}"),
                 kind: "calls".to_string(),
                 line: i,
@@ -1818,6 +1771,7 @@ mod keyset_pagination_tests {
             .map(|i| RawEdge {
                 from_file: "/file_a.rs".to_string(),
                 from_name: format!("fn_a{i}"),
+                from_fqn: format!("/file_a.rs::fn_a{i}"),
                 to_name: format!("target{i}"),
                 kind: "calls".to_string(),
                 line: i,
@@ -2038,6 +1992,7 @@ mod incremental_phase2_tests {
         struct RawEdge {
             from_file: String,
             from_name: String,
+            from_fqn: String,
             to_name: String,
             kind: String,
             line: i64,
@@ -2045,6 +2000,7 @@ mod incremental_phase2_tests {
         let rec = vec![RawEdge {
             from_file: from_file.to_string(),
             from_name: from_name.to_string(),
+            from_fqn: format!("{}::{}", from_file, from_name),
             to_name: to_name.to_string(),
             kind: "calls".to_string(),
             line: 1,
@@ -2174,14 +2130,17 @@ mod incremental_phase2_tests {
         );
 
         // A->B edge must be present.
+        // in_name and out_name now store full FQNs (file::name).
         let a_to_b = final_calls.iter().any(|(in_f, out_f, in_n, out_n)| {
-            in_f == "/a.rs" && out_f == "/b.rs" && in_n == "a_fn" && out_n == "b_fn"
+            in_f == "/a.rs" && out_f == "/b.rs"
+                && in_n == "/a.rs::a_fn" && out_n == "/b.rs::b_fn"
         });
         assert!(a_to_b, "A->B edge (a_fn -> b_fn) must be present; got {:?}", final_calls);
 
         // B->C edge must be present.
         let b_to_c = final_calls.iter().any(|(in_f, out_f, in_n, out_n)| {
-            in_f == "/b.rs" && out_f == "/c.rs" && in_n == "b_fn" && out_n == "c_fn"
+            in_f == "/b.rs" && out_f == "/c.rs"
+                && in_n == "/b.rs::b_fn" && out_n == "/c.rs::c_fn"
         });
         assert!(b_to_c, "B->C edge (b_fn -> c_fn) must be present; got {:?}", final_calls);
 
@@ -2233,7 +2192,8 @@ mod incremental_phase2_tests {
         println!("Initial calls: {:?}", initial_calls);
         assert_eq!(initial_calls.len(), 1, "initial state must have exactly 1 calls edge");
         let x_to_z = initial_calls.iter().any(|(in_f, out_f, _, out_n)| {
-            in_f == "/x_caller.rs" && out_f == "/z_defines_foo.rs" && out_n == "foo"
+            in_f == "/x_caller.rs" && out_f == "/z_defines_foo.rs"
+                && out_n == "/z_defines_foo.rs::foo"
         });
         assert!(x_to_z, "X→foo must initially resolve to Z; got {:?}", initial_calls);
 
@@ -2263,7 +2223,8 @@ mod incremental_phase2_tests {
 
         // X→foo must now point to W ("/a_defines_foo.rs"), not Z.
         let x_to_w = final_calls.iter().any(|(in_f, out_f, _, out_n)| {
-            in_f == "/x_caller.rs" && out_f == "/a_defines_foo.rs" && out_n == "foo"
+            in_f == "/x_caller.rs" && out_f == "/a_defines_foo.rs"
+                && out_n == "/a_defines_foo.rs::foo"
         });
         assert!(
             x_to_w,
@@ -2311,7 +2272,7 @@ mod incremental_phase2_tests {
         println!("Initial calls: {:?}", initial_calls);
         assert_eq!(initial_calls.len(), 1, "initial: 1 calls edge");
         let x_to_w = initial_calls.iter().any(|(in_f, out_f, _, out_n)| {
-            in_f == "/x.rs" && out_f == "/w.rs" && out_n == "bar"
+            in_f == "/x.rs" && out_f == "/w.rs" && out_n == "/w.rs::bar"
         });
         assert!(x_to_w, "X→bar must initially resolve to W; got {:?}", initial_calls);
 
@@ -2358,7 +2319,7 @@ mod incremental_phase2_tests {
 
         // X→bar must now resolve to Y (the remaining candidate after W removed bar).
         let x_to_y = final_calls.iter().any(|(in_f, out_f, _, out_n)| {
-            in_f == "/x.rs" && out_f == "/y.rs" && out_n == "bar"
+            in_f == "/x.rs" && out_f == "/y.rs" && out_n == "/y.rs::bar"
         });
         assert!(
             x_to_y,
@@ -2406,7 +2367,7 @@ mod incremental_phase2_tests {
         let initial_calls = all_calls(&db).await;
         assert_eq!(initial_calls.len(), 1, "initial: 1 calls edge");
         let x_to_w = initial_calls.iter().any(|(in_f, out_f, _, out_n)| {
-            in_f == "/x.rs" && out_f == "/w.rs" && out_n == "foo"
+            in_f == "/x.rs" && out_f == "/w.rs" && out_n == "/w.rs::foo"
         });
         assert!(x_to_w, "X→foo must initially resolve to W; got {:?}", initial_calls);
 
@@ -2458,7 +2419,7 @@ mod incremental_phase2_tests {
 
         // X→foo must still resolve to W (re-resolved via direction-1).
         let x_to_w_again = final_calls.iter().any(|(in_f, out_f, _, out_n)| {
-            in_f == "/x.rs" && out_f == "/w.rs" && out_n == "foo"
+            in_f == "/x.rs" && out_f == "/w.rs" && out_n == "/w.rs::foo"
         });
         assert!(
             x_to_w_again,

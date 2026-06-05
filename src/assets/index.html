@@ -479,6 +479,7 @@
         </button>
       </form>
       <div id="search-error" class="hidden mb-3 text-sm text-red-600 dark:text-red-400"></div>
+      <div id="search-timing" class="hidden mb-3 text-xs text-gray-400 dark:text-wiki-text-muted"></div>
 
       <!-- Result sub-tabs: Results / Pre-rerank / LLM Response -->
       <div id="search-result-tabs" class="hidden">
@@ -538,7 +539,6 @@
         </div>
       </div>
 
-      <div id="search-timing" class="hidden mt-3 text-xs text-gray-400 dark:text-wiki-text-muted"></div>
     </div>
   </div><!-- /search-page -->
 </div><!-- /container -->
@@ -743,8 +743,14 @@ function renderRepos() {
                      focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:opacity-40 disabled:cursor-not-allowed">
         Index
       </button>
-      <button data-idx="${idx}" class="btn-remove-repo text-gray-400 dark:text-wiki-text-muted hover:text-red-500 dark:hover:text-red-400 text-xs
-              focus:outline-none focus:ring-2 focus:ring-red-300 rounded px-2 py-1">Remove</button>
+      <div class="relative">
+        <button data-idx="${idx}" class="btn-remove-toggle text-gray-400 dark:text-wiki-text-muted hover:text-red-500 dark:hover:text-red-400 text-xs
+                focus:outline-none focus:ring-2 focus:ring-red-300 rounded px-2 py-1">Remove</button>
+        <div data-idx="${idx}" class="remove-dropdown hidden absolute right-0 top-full mt-1 z-50 min-w-[140px] border border-gray-200 dark:border-wiki-border rounded bg-white dark:bg-wiki-surface shadow-lg py-1">
+          <button data-repo="${escHtml(repo)}" class="btn-remove-index w-full text-left px-3 py-1.5 text-xs text-gray-700 dark:text-wiki-text hover:bg-gray-100 dark:hover:bg-wiki-bg">Remove Indexes</button>
+          <button data-idx="${idx}" class="btn-remove-repo w-full text-left px-3 py-1.5 text-xs text-red-600 dark:text-red-400 hover:bg-gray-100 dark:hover:bg-wiki-bg">Remove Repo</button>
+        </div>
+      </div>
     `;
     list.appendChild(row);
   });
@@ -774,8 +780,41 @@ function renderRepos() {
     });
   });
 
+  list.querySelectorAll('.btn-remove-toggle').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      // Close any other open dropdowns first.
+      list.querySelectorAll('.remove-dropdown').forEach(d => d.classList.add('hidden'));
+      const dropdown = btn.parentElement.querySelector('.remove-dropdown');
+      dropdown.classList.toggle('hidden');
+    });
+  });
+
+  list.querySelectorAll('.btn-remove-index').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const repo = btn.dataset.repo;
+      const repoId = encodeRepoId(repo);
+      btn.textContent = 'Removing…';
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/repos/' + repoId + '/index', { method: 'DELETE' });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          showError(data.error || 'Failed to remove indexes');
+        }
+      } catch (err) {
+        showError('Network error: ' + err.message);
+      }
+      btn.closest('.remove-dropdown').classList.add('hidden');
+      await pollIndexStatus();
+    });
+  });
+
   list.querySelectorAll('.btn-remove-repo').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      btn.closest('.remove-dropdown').classList.add('hidden');
       cfg.repos.splice(parseInt(btn.dataset.idx, 10), 1);
       renderRepos();
       saveNow();
@@ -1949,6 +1988,11 @@ function watchIndexingThenReload() {
 // ─── Init ─────────────────────────────────────────────────────────────────
 loadConfig();
 startIndexPolling();
+
+// Close remove dropdowns on outside click.
+document.addEventListener('click', () => {
+  document.querySelectorAll('.remove-dropdown').forEach(d => d.classList.add('hidden'));
+});
 
 // Index All button.
 document.getElementById('btn-index-all').addEventListener('click', async () => {
