@@ -5,7 +5,7 @@ use tracing::debug;
 
 /// Extensions considered indexable code/config.
 pub const CODE_EXTENSIONS: &[&str] = &[
-    "py", "js", "ts", "tsx", "jsx", "rs", "go", "java", "cs", "cpp", "c", "h", "hpp",
+    "py", "js", "ts", "tsx", "jsx", "rs", "go", "java", "cs", "cpp", "c", "h", "hpp", "cc", "cxx", "hxx", "hh",
     "rb", "php", "swift", "kt", "scala", "ex", "exs", "clj", "hs", "ml", "lua", "r",
     "sh", "bash", "zsh", "fish", "ps1", "yaml", "yml", "toml", "json", "xml", "html",
     "css", "scss", "sql", "proto", "graphql", "md", "txt", "dockerfile", "tf", "hcl",

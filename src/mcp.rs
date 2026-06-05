@@ -395,6 +395,16 @@ async fn do_query(
         Err(e) => format!("Error: query failed: {e}"),
         Ok(result) => {
             if result.results.is_empty() {
+                let rerank_rejected = result.rerank.as_ref().is_some_and(|r| {
+                    !r.fallback_used && r.skip_reason.is_none() && !r.raw_response.is_empty()
+                });
+                if rerank_rejected {
+                    return "No relevant code found. The indexed codebase does not appear to \
+                            contain information related to this query. Please verify the query \
+                            is relevant to this project, or try alternative tools such as Grep \
+                            for exact-match searches."
+                        .to_string();
+                }
                 return format!("No results found for: {information_request}");
             }
             let mut out = String::new();

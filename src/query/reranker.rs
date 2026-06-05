@@ -152,12 +152,12 @@ fn parse_rerank_response(response: &str, n: usize, elapsed_ms: u64) -> RerankOut
 
     if indices.is_empty() {
         return RerankOutput {
-            reranked_indices: all_indices,
+            reranked_indices: vec![],
             raw_request: String::new(),
             raw_response: response.to_owned(),
             elapsed_ms,
-            fallback_used: true,
-            skip_reason: Some("LLM returned empty ranking".to_owned()),
+            fallback_used: false,
+            skip_reason: None,
         };
     }
 

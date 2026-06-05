@@ -84,10 +84,11 @@ DEFINE FIELD OVERWRITE value ON index_meta TYPE string;
 DEFINE INDEX IF NOT EXISTS idx_meta_key ON index_meta FIELDS key UNIQUE;
 
 DEFINE TABLE IF NOT EXISTS raw_edge SCHEMAFULL;
-DEFINE FIELD OVERWRITE from_file ON raw_edge TYPE string;
-DEFINE FIELD OVERWRITE from_name ON raw_edge TYPE string;
-DEFINE FIELD OVERWRITE to_name   ON raw_edge TYPE string;
-DEFINE FIELD OVERWRITE kind      ON raw_edge TYPE string;
-DEFINE FIELD OVERWRITE line      ON raw_edge TYPE int;
+DEFINE FIELD OVERWRITE from_file    ON raw_edge TYPE string;
+DEFINE FIELD OVERWRITE from_name    ON raw_edge TYPE string;
+DEFINE FIELD OVERWRITE to_name      ON raw_edge TYPE string;
+DEFINE FIELD OVERWRITE kind         ON raw_edge TYPE string;
+DEFINE FIELD OVERWRITE line         ON raw_edge TYPE int;
+DEFINE FIELD OVERWRITE import_path  ON raw_edge TYPE option<string>;
 DEFINE INDEX IF NOT EXISTS idx_raw_edge_from_file ON raw_edge FIELDS from_file;
 "#;

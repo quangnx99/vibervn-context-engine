@@ -72,6 +72,7 @@ struct RawEdgeRecord {
     to_name: String,
     kind: String,
     line: i64,
+    import_path: Option<String>,
 }
 
 /// A parsed file result ready for the embed stage.
@@ -446,6 +447,60 @@ impl IndexPipeline {
 
     // ─── Phase 2: batched edge resolution ────────────────────────────────
 
+    /// Select the best candidate symbol using 4-level priority:
+    ///
+    /// Level 1: If `import_path` contains `/`, find the candidate whose file path
+    ///          `ends_with(import_path)`.
+    /// Level 2: If `import_path` is bare (no `/`), find a candidate in the same
+    ///          directory as `from_file` (compare parent directory component).
+    /// Level 3: Same-file match (`candidate.file == from_file`).
+    /// Level 4: First in pre-sorted bucket order (`bucket.first()`).
+    ///
+    /// Within each level, `.find()` on the pre-sorted bucket gives deterministic
+    /// first-match. The bucket is pre-sorted by `(file, line_start, line_end)`.
+    fn select_best_candidate<'a>(
+        candidates: &'a [SymbolWithPos],
+        from_file: &str,
+        import_path: Option<&str>,
+    ) -> Option<&'a SymbolWithPos> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Level 1 / Level 2 — only attempted when import_path is present.
+        if let Some(imp) = import_path {
+            if imp.contains('/') {
+                // Level 1: path ends_with import_path (handles subdirectory imports).
+                if let Some(found) = candidates.iter().find(|c| c.file.ends_with(imp)) {
+                    return Some(found);
+                }
+            } else {
+                // Level 2: bare filename — same parent directory as from_file.
+                let from_dir = std::path::Path::new(from_file)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("");
+                if let Some(found) = candidates.iter().find(|c| {
+                    std::path::Path::new(&c.file)
+                        .parent()
+                        .and_then(|p| p.to_str())
+                        .map(|d| d == from_dir)
+                        .unwrap_or(false)
+                }) {
+                    return Some(found);
+                }
+            }
+        }
+
+        // Level 3: same-file match.
+        if let Some(found) = candidates.iter().find(|c| c.file == from_file) {
+            return Some(found);
+        }
+
+        // Level 4: first in sorted order.
+        candidates.first()
+    }
+
     /// Resolve raw edges (stored in `raw_edge` table) into denormalized `calls`
     /// rows using batched symbol lookups. Never loads all symbols into RAM.
     ///
@@ -517,6 +572,7 @@ impl IndexPipeline {
             #[allow(dead_code)]
             kind: String,
             line: i64,
+            import_path: Option<String>,
         }
 
         let page_size: i64 = WRITE_BATCH_SIZE as i64;
@@ -531,7 +587,7 @@ impl IndexPipeline {
             let batch: Vec<RawEdgeRow> = db
                 .query(
                     "SELECT type::string(id) AS id_str, \
-                            from_file, from_name, to_name, kind, line \
+                            from_file, from_name, to_name, kind, line, import_path \
                      FROM raw_edge \
                      WHERE type::string(id) > $cursor \
                      ORDER BY id_str \
@@ -578,12 +634,12 @@ impl IndexPipeline {
             for row in &batch {
                 let resolved_to = match name_bucket.get(&row.to_name) {
                     Some(candidates) if !candidates.is_empty() => {
-                        // Prefer same-file candidate; else first in sorted order.
-                        candidates
-                            .iter()
-                            .find(|c| c.file == row.from_file)
-                            .or_else(|| candidates.first())
-                            .cloned()
+                        // Use 4-level import-aware priority selection.
+                        Self::select_best_candidate(
+                            candidates,
+                            &row.from_file,
+                            row.import_path.as_deref(),
+                        ).cloned()
                     }
                     _ => {
                         debug!(name = %row.to_name, "phase2: dropping unresolved raw edge");
@@ -758,6 +814,7 @@ impl IndexPipeline {
             #[allow(dead_code)]
             kind: String,
             line: i64,
+            import_path: Option<String>,
         }
 
         let page_size: i64 = WRITE_BATCH_SIZE as i64;
@@ -768,7 +825,7 @@ impl IndexPipeline {
             let batch: Vec<RawEdgeRow> = db
                 .query(
                     "SELECT type::string(id) AS id_str, \
-                            from_file, from_name, to_name, kind, line \
+                            from_file, from_name, to_name, kind, line, import_path \
                      FROM raw_edge \
                      WHERE from_file IN $files \
                        AND type::string(id) > $cursor \
@@ -815,11 +872,12 @@ impl IndexPipeline {
             for row in &batch {
                 let resolved_to = match name_bucket.get(&row.to_name) {
                     Some(candidates) if !candidates.is_empty() => {
-                        candidates
-                            .iter()
-                            .find(|c| c.file == row.from_file)
-                            .or_else(|| candidates.first())
-                            .cloned()
+                        // Use 4-level import-aware priority selection.
+                        Self::select_best_candidate(
+                            candidates,
+                            &row.from_file,
+                            row.import_path.as_deref(),
+                        ).cloned()
                     }
                     _ => {
                         debug!(name = %row.to_name, "incremental phase2: dropping unresolved raw edge");
@@ -893,9 +951,9 @@ fn parse_one_file(file: &str) -> Option<ParsedFile> {
         .edges
         .iter()
         .filter_map(|e| {
-            let to_name = match &e.to {
-                EdgeTarget::Unresolved { name, .. } => name.clone(),
-                EdgeTarget::Resolved(qs) => qs.name.clone(),
+            let (to_name, import_path) = match &e.to {
+                EdgeTarget::Unresolved { name, import_path, .. } => (name.clone(), import_path.clone()),
+                EdgeTarget::Resolved(qs) => (qs.name.clone(), None),
             };
             // Only store Calls edges (❼ spec: only `calls` table uses in_name/out_name).
             if matches!(e.kind, EdgeKind::Calls) {
@@ -905,6 +963,7 @@ fn parse_one_file(file: &str) -> Option<ParsedFile> {
                     to_name,
                     kind: "calls".to_string(),
                     line: e.line as i64,
+                    import_path,
                 })
             } else {
                 // For non-calls edges, still resolve them synchronously (no in_name needed).

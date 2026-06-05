@@ -26,6 +26,8 @@ tree-sitter-typescript = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-go = "0.23"
 tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
