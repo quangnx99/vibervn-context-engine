@@ -349,6 +349,9 @@ async fn run_consumer(
                 s.total_files = stats.total_files;
                 s.last_indexed_at = Some(Utc::now());
                 s.error = None;
+                // Persist durable timestamp so the MCP tool can check freshness
+                // without relying on in-memory state.
+                let _ = crate::store::ops::set_meta(&db, "last_indexed_at", &chrono::Utc::now().to_rfc3339()).await;
             }
             Err(e) => {
                 // `{e:#}` prints the full anyhow context chain on one line

@@ -1,11 +1,16 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use reqwest::Client;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 
 use context_engine_rs::config::{Settings, config_path};
+use context_engine_rs::indexing::IndexEngine;
 use context_engine_rs::server::build_router;
+use context_engine_rs::store::RepoDbMap;
 
 /// Boot the axum server bound to port 0 (OS assigns a free port).
 /// Returns the bound address and a join handle for the server task.
@@ -14,7 +19,16 @@ async fn start_server(home: &TempDir) -> SocketAddr {
         .await
         .expect("failed to bind ephemeral port");
     let addr = listener.local_addr().expect("no local addr");
-    let app = build_router(home.path().to_path_buf());
+    let settings = Settings::default();
+    let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+    let index_engine = IndexEngine::start(home.path().to_path_buf(), &settings, repo_dbs.clone()).await;
+    let app = build_router(
+        home.path().to_path_buf(),
+        index_engine,
+        repo_dbs,
+        settings,
+        "127.0.0.1",
+    );
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("server error");
     });

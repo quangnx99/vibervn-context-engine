@@ -87,7 +87,7 @@ async fn main() {
             std::process::exit(2);
         });
 
-    let app = server::build_router(home_dir, index_engine, repo_dbs, settings);
+    let app = server::build_router(home_dir, index_engine, repo_dbs, settings, &bind);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

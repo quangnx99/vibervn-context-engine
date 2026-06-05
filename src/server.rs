@@ -16,6 +16,11 @@ use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
 use tokio::sync::RwLock;
 
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService,
+    session::local::LocalSessionManager,
+};
+
 use crate::config::{
     ConfigError, CURRENT_VERSION, Settings, ensure_dir_and_load, write_settings_atomic,
     config_path,
@@ -23,6 +28,7 @@ use crate::config::{
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
 use crate::llm::LlmClient;
+use crate::mcp::{McpHandler, run_codebase_retrieval};
 use crate::path_in_repo;
 use crate::store;
 use crate::query;
@@ -79,8 +85,46 @@ pub fn build_router(
     index_engine: Arc<IndexEngine>,
     repo_dbs: Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     settings: Settings,
+    bind_host: &str,
 ) -> Router {
-    let state = AppState { home_dir, index_engine, repo_dbs, settings };
+    let state = AppState { home_dir: home_dir.clone(), index_engine: index_engine.clone(), repo_dbs: repo_dbs.clone(), settings: settings.clone() };
+
+    // Build the StreamableHttpService for the /mcp endpoint.
+    // The factory closure must return a fresh McpHandler per session.
+    let mcp_home = home_dir.clone();
+    let mcp_engine = index_engine.clone();
+    let mcp_dbs = repo_dbs.clone();
+    let mcp_settings = settings.clone();
+
+    let mcp_config = {
+        // DNS-rebinding protection: if bind is non-loopback, add it to allowed_hosts.
+        let is_loopback = matches!(bind_host, "127.0.0.1" | "localhost" | "::1");
+        if is_loopback {
+            StreamableHttpServerConfig::default()
+        } else {
+            StreamableHttpServerConfig::default().with_allowed_hosts(vec![
+                bind_host.to_string(),
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "::1".to_string(),
+            ])
+        }
+    };
+
+    let session_manager = Arc::new(LocalSessionManager::default());
+    let mcp_service = StreamableHttpService::new(
+        move || {
+            Ok(McpHandler::new(
+                mcp_home.clone(),
+                mcp_engine.clone(),
+                mcp_dbs.clone(),
+                mcp_settings.clone(),
+            ))
+        },
+        session_manager,
+        mcp_config,
+    );
+
     Router::new()
         .route("/", get(serve_index))
         .route("/api/config", get(get_config))
@@ -95,6 +139,8 @@ pub fn build_router(
         .route("/api/index-all", post(post_index_all))
         .route("/api/index-status", get(get_index_status))
         .route("/api/query", post(post_query))
+        .route("/api/mcp-tool", post(post_mcp_tool))
+        .merge(Router::new().nest_service("/mcp", mcp_service))
         .with_state(state)
 }
 
@@ -518,4 +564,33 @@ async fn post_query(
             (StatusCode::BAD_GATEWAY, Json(body)).into_response()
         }
     }
+}
+
+// ─── MCP tool REST proxy ──────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct McpToolRequest {
+    information_request: String,
+    workspace_full_path: String,
+}
+
+/// POST /api/mcp-tool — call the shared MCP tool funnel over HTTP.
+///
+/// The response JSON contains `{ "result": "<plain text>" }`. The text is
+/// byte-identical to what the MCP tool returns for the same inputs, so the
+/// "Test" sub-tab in the web UI exercises the exact same code path.
+async fn post_mcp_tool(
+    State(state): State<AppState>,
+    Json(req): Json<McpToolRequest>,
+) -> Response {
+    let result = run_codebase_retrieval(
+        &state.home_dir,
+        &state.index_engine,
+        &state.repo_dbs,
+        &state.settings,
+        &req.information_request,
+        &req.workspace_full_path,
+    )
+    .await;
+    Json(json!({ "result": result })).into_response()
 }

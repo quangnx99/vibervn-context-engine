@@ -55,6 +55,14 @@ impl Default for LlmConfig {
     }
 }
 
+fn default_mcp_index_wait_secs() -> u64 {
+    50
+}
+
+fn default_mcp_stale_after_days() -> u64 {
+    7
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     /// Schema version. Server always stamps CURRENT_VERSION on write.
@@ -63,6 +71,14 @@ pub struct Settings {
     pub repos: Vec<String>,
     pub embedding: EmbeddingConfig,
     pub llm: LlmConfig,
+    /// Maximum wall-clock seconds the MCP tool will wait for indexing to finish
+    /// before returning a partial/error response.
+    #[serde(default = "default_mcp_index_wait_secs")]
+    pub mcp_index_wait_secs: u64,
+    /// Number of days after which a durable last_indexed_at timestamp is
+    /// considered stale for MCP freshness checks.
+    #[serde(default = "default_mcp_stale_after_days")]
+    pub mcp_stale_after_days: u64,
 }
 
 impl Default for Settings {
@@ -72,6 +88,8 @@ impl Default for Settings {
             repos: Vec::new(),
             embedding: EmbeddingConfig::default(),
             llm: LlmConfig::default(),
+            mcp_index_wait_secs: default_mcp_index_wait_secs(),
+            mcp_stale_after_days: default_mcp_stale_after_days(),
         }
     }
 }

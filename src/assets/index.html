@@ -98,6 +98,12 @@
                      focus:outline-none focus:ring-2 focus:ring-blue-400">
         Settings
       </button>
+      <button role="tab" id="tab-mcp" aria-selected="false" aria-controls="panel-mcp"
+              class="tab-btn px-4 py-2 text-sm border-b-2 border-transparent text-gray-500 dark:text-wiki-text-muted
+                     hover:text-gray-900 dark:hover:text-wiki-heading hover:border-gray-300 dark:hover:border-wiki-border
+                     focus:outline-none focus:ring-2 focus:ring-blue-400">
+        MCP
+      </button>
     </div>
 
     <!-- Tab: Repositories (default) -->
@@ -220,6 +226,107 @@
         </form>
       </section>
     </div>
+
+    <!-- Tab: MCP -->
+    <div role="tabpanel" id="panel-mcp" class="hidden">
+
+      <!-- MCP sub-tab bar -->
+      <div role="tablist" id="tablist-mcp" class="flex border-b border-gray-200 dark:border-wiki-border mb-6">
+        <button role="tab" id="mcptab-endpoint" aria-selected="true" aria-controls="mcppanel-endpoint"
+                class="mcptab-btn px-4 py-2 text-sm border-b-2 border-blue-600 dark:border-wiki-border-active text-gray-900 dark:text-wiki-heading
+                       focus:outline-none focus:ring-2 focus:ring-blue-400">
+          Endpoint
+        </button>
+        <button role="tab" id="mcptab-claude" aria-selected="false" aria-controls="mcppanel-claude"
+                class="mcptab-btn px-4 py-2 text-sm border-b-2 border-transparent text-gray-500 dark:text-wiki-text-muted
+                       hover:text-gray-900 dark:hover:text-wiki-heading hover:border-gray-300 dark:hover:border-wiki-border
+                       focus:outline-none focus:ring-2 focus:ring-blue-400">
+          Claude Code
+        </button>
+        <button role="tab" id="mcptab-test" aria-selected="false" aria-controls="mcppanel-test"
+                class="mcptab-btn px-4 py-2 text-sm border-b-2 border-transparent text-gray-500 dark:text-wiki-text-muted
+                       hover:text-gray-900 dark:hover:text-wiki-heading hover:border-gray-300 dark:hover:border-wiki-border
+                       focus:outline-none focus:ring-2 focus:ring-blue-400">
+          Test
+        </button>
+      </div>
+
+      <!-- MCP sub-panel: Endpoint -->
+      <div role="tabpanel" id="mcppanel-endpoint">
+        <p class="text-sm text-gray-600 dark:text-wiki-text-muted mb-3">
+          Streamable-HTTP MCP endpoint. Point any MCP-compatible client here.
+        </p>
+        <div class="flex items-center gap-2">
+          <code id="mcp-endpoint-url"
+                class="flex-1 font-mono text-sm px-3 py-2 rounded border border-gray-200 dark:border-wiki-border
+                       bg-gray-50 dark:bg-wiki-surface text-gray-800 dark:text-wiki-link select-all"></code>
+          <button id="btn-copy-endpoint"
+                  class="px-3 py-2 text-sm rounded border border-gray-300 dark:border-wiki-border
+                         text-gray-600 dark:text-wiki-text-muted hover:bg-gray-100 dark:hover:bg-wiki-surface
+                         hover:text-gray-900 dark:hover:text-wiki-text
+                         focus:outline-none focus:ring-2 focus:ring-blue-400">
+            Copy
+          </button>
+        </div>
+      </div>
+
+      <!-- MCP sub-panel: Claude Code -->
+      <div role="tabpanel" id="mcppanel-claude" class="hidden">
+        <p class="text-sm text-gray-600 dark:text-wiki-text-muted mb-3">
+          Run this command in your terminal to register the MCP server with Claude Code.
+        </p>
+        <div class="flex items-center gap-2">
+          <code id="mcp-claude-cmd"
+                class="flex-1 font-mono text-sm px-3 py-2 rounded border border-gray-200 dark:border-wiki-border
+                       bg-gray-50 dark:bg-wiki-surface text-gray-800 dark:text-wiki-link select-all whitespace-pre-wrap break-all block"></code>
+          <button id="btn-copy-claude"
+                  class="px-3 py-2 text-sm rounded border border-gray-300 dark:border-wiki-border
+                         text-gray-600 dark:text-wiki-text-muted hover:bg-gray-100 dark:hover:bg-wiki-surface
+                         hover:text-gray-900 dark:hover:text-wiki-text
+                         focus:outline-none focus:ring-2 focus:ring-blue-400 shrink-0">
+            Copy
+          </button>
+        </div>
+        <!-- Placeholder: add more agent registration commands here as needed -->
+      </div>
+
+      <!-- MCP sub-panel: Test -->
+      <div role="tabpanel" id="mcppanel-test" class="hidden">
+        <p class="text-sm text-gray-600 dark:text-wiki-text-muted mb-4">
+          Send a request directly to the MCP tool and see the raw output.
+        </p>
+        <div class="space-y-3 mb-4">
+          <div>
+            <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1"
+                   for="mcp-test-query">information_request</label>
+            <textarea id="mcp-test-query" rows="3"
+                      placeholder="e.g. Where is authentication handled?"
+                      class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
+                             placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted resize-y
+                             focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active"></textarea>
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1"
+                   for="mcp-test-workspace">workspace_full_path</label>
+            <input id="mcp-test-workspace" type="text" placeholder="/absolute/path/to/repo"
+                   class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
+                          placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                          focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+          </div>
+        </div>
+        <button id="btn-mcp-run"
+                class="px-4 py-2 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded
+                       hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400
+                       disabled:opacity-50 disabled:cursor-not-allowed">
+          Run
+        </button>
+        <div id="mcp-test-error" class="hidden mt-3 text-sm text-red-600 dark:text-red-400"></div>
+        <pre id="mcp-test-output"
+             class="hidden mt-4 text-xs p-3 border border-gray-200 dark:border-wiki-border rounded bg-white dark:bg-wiki-surface
+                    text-gray-800 dark:text-wiki-text font-mono leading-relaxed overflow-x-auto whitespace-pre-wrap max-h-[600px] overflow-y-auto"></pre>
+      </div>
+
+    </div><!-- /panel-mcp -->
   </div><!-- /main-content -->
 
   <!-- Repo detail page (full overlay, hidden by default) -->
@@ -508,6 +615,7 @@ function showVersionBanner() {
 const TABS = [
   { btn: 'tab-repos',     panel: 'panel-repos' },
   { btn: 'tab-settings',  panel: 'panel-settings' },
+  { btn: 'tab-mcp',       panel: 'panel-mcp' },
 ];
 
 function activateTab(idx) {
@@ -526,6 +634,8 @@ function activateTab(idx) {
       panel.classList.add('hidden');
     }
   });
+  // Populate MCP URLs/commands when the MCP tab becomes active.
+  if (idx === 2) { initMcpUrls(); }
 }
 
 TABS.forEach((t, i) => {
@@ -832,6 +942,102 @@ function closeRepoSearch() {
 }
 
 document.getElementById('btn-search-back').addEventListener('click', closeRepoSearch);
+
+// ─── MCP tab init (populate URLs when the MCP tab is shown) ──────────────
+function initMcpUrls() {
+  const origin = window.location.origin;
+  const endpointUrl = origin + '/mcp';
+  const claudeCmd = 'claude mcp add --scope user --transport http codebase-retrieval ' + endpointUrl;
+
+  document.getElementById('mcp-endpoint-url').textContent = endpointUrl;
+  document.getElementById('mcp-claude-cmd').textContent = claudeCmd;
+
+  // Pre-fill workspace_full_path with the first configured repo if available.
+  const workspaceInput = document.getElementById('mcp-test-workspace');
+  if (cfg && cfg.repos && cfg.repos.length > 0 && !workspaceInput.value) {
+    workspaceInput.value = cfg.repos[0];
+  }
+}
+
+// ─── MCP sub-tab switching ────────────────────────────────────────────────
+const MCP_TABS = [
+  { btn: 'mcptab-endpoint', panel: 'mcppanel-endpoint' },
+  { btn: 'mcptab-claude',   panel: 'mcppanel-claude' },
+  { btn: 'mcptab-test',     panel: 'mcppanel-test' },
+];
+
+function activateMcpTab(idx) {
+  MCP_TABS.forEach((t, i) => {
+    const btn = document.getElementById(t.btn);
+    const panel = document.getElementById(t.panel);
+    if (i === idx) {
+      btn.setAttribute('aria-selected', 'true');
+      btn.classList.remove('border-transparent', 'text-gray-500', 'dark:text-wiki-text-muted');
+      btn.classList.add('border-blue-600', 'dark:border-wiki-border-active', 'text-gray-900', 'dark:text-wiki-heading');
+      panel.classList.remove('hidden');
+    } else {
+      btn.setAttribute('aria-selected', 'false');
+      btn.classList.add('border-transparent', 'text-gray-500', 'dark:text-wiki-text-muted');
+      btn.classList.remove('border-blue-600', 'dark:border-wiki-border-active', 'text-gray-900', 'dark:text-wiki-heading');
+      panel.classList.add('hidden');
+    }
+  });
+}
+
+MCP_TABS.forEach((t, i) => {
+  document.getElementById(t.btn).addEventListener('click', () => activateMcpTab(i));
+});
+
+// Copy-button helper: write text to clipboard, flash "Copied" for 1.5s.
+function makeCopyBtn(btnId, getTextFn) {
+  document.getElementById(btnId).addEventListener('click', () => {
+    const btn = document.getElementById(btnId);
+    navigator.clipboard.writeText(getTextFn()).then(() => {
+      const orig = btn.textContent;
+      btn.textContent = 'Copied';
+      setTimeout(() => { btn.textContent = orig; }, 1500);
+    }).catch(() => {});
+  });
+}
+makeCopyBtn('btn-copy-endpoint', () => document.getElementById('mcp-endpoint-url').textContent);
+makeCopyBtn('btn-copy-claude',   () => document.getElementById('mcp-claude-cmd').textContent);
+
+// Run the MCP test tool call.
+async function runMcpTest() {
+  const btn = document.getElementById('btn-mcp-run');
+  const errorEl = document.getElementById('mcp-test-error');
+  const outputEl = document.getElementById('mcp-test-output');
+  const query = document.getElementById('mcp-test-query').value.trim();
+  const workspace = document.getElementById('mcp-test-workspace').value.trim();
+
+  errorEl.classList.add('hidden');
+  outputEl.classList.add('hidden');
+  btn.disabled = true;
+  btn.textContent = 'Running…';
+
+  try {
+    const res = await fetch('/api/mcp-tool', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ information_request: query, workspace_full_path: workspace }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      errorEl.textContent = data.error || 'Request failed (HTTP ' + res.status + ')';
+      errorEl.classList.remove('hidden');
+      return;
+    }
+    outputEl.textContent = data.result ?? '';
+    outputEl.classList.remove('hidden');
+  } catch (err) {
+    errorEl.textContent = 'Network error: ' + err.message;
+    errorEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Run';
+  }
+}
+document.getElementById('btn-mcp-run').addEventListener('click', runMcpTest);
 
 // ─── Sub-tab switching ──────────────────────────────────────────────────────
 const SUBTABS = [
