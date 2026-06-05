@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
 use tracing::{debug, info, warn};
@@ -13,8 +14,25 @@ use crate::indexing::walker::walk_repo;
 use crate::parsing::parse_file;
 use crate::parsing::relations::{EdgeKind, EdgeTarget, RawEdge};
 use crate::parsing::symbols::{QualifiedSymbol, Symbol};
-use crate::store::ops::get_all_file_meta;
+use crate::store::ops::{FileMeta, delete_all_data, delete_file_data, get_all_file_meta, upsert_file_meta};
 use crate::vector::{ChunkId, VectorIndex};
+
+/// Batch size for DB writes — keeps per-query payload small and avoids the
+/// gigabyte-sized transaction that caused 3 GB RAM spikes on large repos.
+const WRITE_BATCH_SIZE: usize = 512;
+
+/// A chunk row ready for bulk INSERT via native SurrealDB parameter binding.
+/// Using `Vec<f32>` (not a text-formatted string) means the driver serialises
+/// the embedding as a CBOR array — no float-token parsing by the query engine.
+#[derive(Serialize)]
+struct ChunkRecord {
+    file: String,
+    line_start: i64,
+    line_end: i64,
+    content: String,
+    embedding: Vec<f32>,
+    symbol_ref: Option<String>,
+}
 
 pub struct IndexPipelineStats {
     pub indexed_files: u64,
@@ -139,57 +157,62 @@ impl IndexPipeline {
             .filter_map(|f| stat_file(f).map(|s| (f.clone(), s.mtime, s.size)))
             .collect();
 
-        // 8. Build and execute a single transaction query.
-        let mut txn = String::from("BEGIN TRANSACTION;\n");
+        // 8. Write in independent batches (no outer transaction).
+        //
+        // Order is crash-safe: delete → symbols → edges → chunks → file_meta.
+        // If the process dies before file_meta is written the next run detects
+        // missing/stale meta and rebuilds — the index is never left half-done.
 
-        // Delete everything.
-        txn.push_str("DELETE FROM calls;\n");
-        txn.push_str("DELETE FROM uses;\n");
-        txn.push_str("DELETE FROM imports;\n");
-        txn.push_str("DELETE FROM contains;\n");
-        txn.push_str("DELETE FROM implements;\n");
-        txn.push_str("DELETE FROM symbol;\n");
-        txn.push_str("DELETE FROM chunk;\n");
-        txn.push_str("DELETE FROM file_meta;\n");
+        // Delete everything first.
+        delete_all_data(db).await.context("full_rebuild: delete_all_data")?;
 
-        // Upsert symbols.
-        for sym in &all_symbols {
-            append_upsert_symbol(&mut txn, sym);
-        }
+        // Symbols — flush every WRITE_BATCH_SIZE statements.
+        flush_symbol_batches(db, &all_symbols).await.context("full_rebuild: symbols")?;
 
-        // Insert edges.
-        for (from, to, kind, line) in &resolved_edges {
-            append_insert_edge(&mut txn, from, to, kind, *line);
-        }
+        // Edges — flush every WRITE_BATCH_SIZE statements.
+        flush_edge_batches(db, &resolved_edges).await.context("full_rebuild: edges")?;
 
-        // Insert chunks with embeddings.
+        // Chunks — native Vec<f32> binding, RETURN NONE, batched.
         let mut emb_iter = embeddings.iter();
         let mut chunk_vectors: Vec<(ChunkId, Vec<f32>)> = Vec::new();
+        let mut chunk_batch: Vec<ChunkRecord> = Vec::with_capacity(WRITE_BATCH_SIZE);
 
         for (_file, chunks) in &all_chunks_by_file {
             for chunk in chunks {
                 let emb = emb_iter.next().cloned().unwrap_or_default();
-                append_insert_chunk(&mut txn, chunk, &emb);
                 chunk_vectors.push((
                     ChunkId {
                         file: chunk.file.clone(),
                         line_start: chunk.line_start,
                         line_end: chunk.line_end,
                     },
-                    emb,
+                    emb.clone(),
                 ));
+                chunk_batch.push(ChunkRecord {
+                    file: chunk.file.clone(),
+                    line_start: chunk.line_start as i64,
+                    line_end: chunk.line_end as i64,
+                    content: chunk.content.clone(),
+                    embedding: emb,
+                    symbol_ref: chunk.symbol_ref.as_ref().map(|fqn| format!("symbol:⟨{fqn}⟩")),
+                });
+
+                if chunk_batch.len() >= WRITE_BATCH_SIZE {
+                    flush_chunk_batch(db, std::mem::take(&mut chunk_batch)).await.context("full_rebuild: chunk batch")?;
+                }
             }
         }
-
-        // Upsert file_meta.
-        for (path, mtime, size) in &file_stats {
-            append_upsert_file_meta(&mut txn, path, *mtime, *size, &self.repo);
+        if !chunk_batch.is_empty() {
+            flush_chunk_batch(db, chunk_batch).await.context("full_rebuild: chunk batch (tail)")?;
         }
-
-        txn.push_str("COMMIT TRANSACTION;\n");
-
-        let resp = db.query(&txn).await.context("full_rebuild: transaction failed")?;
-        check_transaction(resp).context("full_rebuild")?;
+        for (path, mtime, size) in &file_stats {
+            upsert_file_meta(db, &FileMeta {
+                path: path.clone(),
+                mtime: *mtime,
+                size: *size,
+                repo: self.repo.clone(),
+            }).await.context("full_rebuild: upsert_file_meta")?;
+        }
 
         Ok(chunk_vectors)
     }
@@ -254,60 +277,73 @@ impl IndexPipeline {
             .filter_map(|f| stat_file(f).map(|s| (f.clone(), s.mtime, s.size)))
             .collect();
 
-        // Build the transaction.
-        let mut txn = String::from("BEGIN TRANSACTION;\n");
+        // Write in independent batches — crash-safe order:
+        // delete → symbols → edges → chunks → file_meta.
 
         // Delete old data for all affected files.
         for file in &all_affected {
-            append_delete_file_data(&mut txn, file);
+            delete_file_data(db, file).await.context("incremental_run: delete_file_data")?;
         }
 
         // Insert new symbols.
-        for sym in &all_symbols {
-            append_upsert_symbol(&mut txn, sym);
-        }
+        flush_symbol_batches(db, &all_symbols).await.context("incremental_run: symbols")?;
 
         // Insert edges.
-        for (from, to, kind, line) in &resolved_edges {
-            append_insert_edge(&mut txn, from, to, kind, *line);
-        }
+        flush_edge_batches(db, &resolved_edges).await.context("incremental_run: edges")?;
 
-        // Insert chunks.
+        // Insert chunks — native Vec<f32>, RETURN NONE, batched.
         let mut emb_iter = embeddings.iter();
         let mut chunk_vectors: Vec<(ChunkId, Vec<f32>)> = Vec::new();
+        let mut chunk_batch: Vec<ChunkRecord> = Vec::with_capacity(WRITE_BATCH_SIZE);
 
         for (_file, chunks) in &all_chunks_by_file {
             for chunk in chunks {
                 let emb = emb_iter.next().cloned().unwrap_or_default();
-                append_insert_chunk(&mut txn, chunk, &emb);
                 chunk_vectors.push((
                     ChunkId {
                         file: chunk.file.clone(),
                         line_start: chunk.line_start,
                         line_end: chunk.line_end,
                     },
-                    emb,
+                    emb.clone(),
                 ));
+                chunk_batch.push(ChunkRecord {
+                    file: chunk.file.clone(),
+                    line_start: chunk.line_start as i64,
+                    line_end: chunk.line_end as i64,
+                    content: chunk.content.clone(),
+                    embedding: emb,
+                    symbol_ref: chunk.symbol_ref.as_ref().map(|fqn| format!("symbol:⟨{fqn}⟩")),
+                });
+
+                if chunk_batch.len() >= WRITE_BATCH_SIZE {
+                    flush_chunk_batch(db, std::mem::take(&mut chunk_batch)).await.context("incremental_run: chunk batch")?;
+                }
             }
         }
+        if !chunk_batch.is_empty() {
+            flush_chunk_batch(db, chunk_batch).await.context("incremental_run: chunk batch (tail)")?;
+        }
 
-        // Upsert file_meta for added/modified files.
+        // file_meta for added/modified files — written LAST (crash-safety anchor).
         for (path, mtime, size) in &file_stats {
-            append_upsert_file_meta(&mut txn, path, *mtime, *size, &self.repo);
+            upsert_file_meta(db, &FileMeta {
+                path: path.clone(),
+                mtime: *mtime,
+                size: *size,
+                repo: self.repo.clone(),
+            }).await.context("incremental_run: upsert_file_meta")?;
         }
 
         // Delete file_meta for deleted files.
         for file in &to_delete {
             let escaped = escape_surreal(file);
-            txn.push_str(&format!(
-                "DELETE FROM file_meta WHERE path = '{escaped}';\n"
-            ));
+            db.query(format!(
+                "DELETE FROM file_meta WHERE path = '{escaped}'"
+            ))
+            .await
+            .context("incremental_run: delete file_meta for deleted file")?;
         }
-
-        txn.push_str("COMMIT TRANSACTION;\n");
-
-        let resp = db.query(&txn).await.context("incremental_run: transaction failed")?;
-        check_transaction(resp).context("incremental_run")?;
 
         Ok((all_affected, chunk_vectors))
     }
@@ -492,68 +528,65 @@ fn resolve_edges(
 
 // ─── SurrealQL escaping ───────────────────────────────────────────────────
 
-/// Inspect a transaction response and return the FIRST meaningful per-statement
-/// error, or `Ok(())` if every statement succeeded.
-///
-/// `Response::check()` is not usable here: when a SurrealDB transaction rolls
-/// back, EVERY statement is annotated with the same generic "The query was not
-/// executed due to a failed transaction" message, and `check()` surfaces only
-/// the first of those — hiding the one statement whose real error (e.g. a type
-/// violation) actually triggered the rollback. `take_errors()` returns the full
-/// `index → error` map, so we skip the generic cascade messages and report the
-/// true culprit with its statement index.
-fn check_transaction(mut resp: surrealdb::Response) -> Result<()> {
-    let errors = resp.take_errors();
-    if errors.is_empty() {
-        return Ok(());
-    }
-    const GENERIC: &str = "The query was not executed due to a failed transaction";
-    // Prefer the first error that is NOT the generic rollback-cascade message.
-    let culprit = errors
-        .iter()
-        .filter(|(_, e)| !e.to_string().contains(GENERIC))
-        .min_by_key(|(idx, _)| **idx);
-    match culprit {
-        Some((idx, e)) => {
-            anyhow::bail!("transaction rolled back — statement #{idx} failed: {e}")
-        }
-        None => {
-            // Only generic cascade messages present (rare): report the lowest index.
-            let (idx, e) = errors.iter().min_by_key(|(idx, _)| **idx).unwrap();
-            anyhow::bail!("transaction rolled back — statement #{idx}: {e}")
-        }
-    }
-}
-
 /// Escape a string for safe embedding in a SurrealQL single-quoted literal.
 /// Handles backslashes (must be first) and single quotes.
 fn escape_surreal(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
-/// Format a Vec<f32> as a SurrealQL array literal: `[0.1, 0.2, ...]`.
-fn format_embedding(emb: &[f32]) -> String {
-    if emb.is_empty() {
-        return "[]".to_string();
+// ─── Batch write helpers ──────────────────────────────────────────────────
+
+/// Flush a batch of chunk records via a native-bind INSERT (no text float
+/// serialisation). Using `RETURN NONE` prevents SurrealDB from echoing the
+/// full embedding vectors back, keeping response allocation small.
+async fn flush_chunk_batch(db: &Surreal<Db>, batch: Vec<ChunkRecord>) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
     }
-    let inner: Vec<String> = emb.iter().map(|v| format!("{v:?}")).collect();
-    format!("[{}]", inner.join(","))
+    db.query("INSERT INTO chunk $data RETURN NONE")
+        .bind(("data", batch))
+        .await
+        .context("flush_chunk_batch")?;
+    Ok(())
+}
+
+/// Flush symbols in batches of WRITE_BATCH_SIZE using text-query statements.
+/// Symbols carry no large float payload so text is fine; batching prevents
+/// a single multi-thousand-statement query.
+async fn flush_symbol_batches(
+    db: &Surreal<Db>,
+    symbols: &[Symbol],
+) -> Result<()> {
+    for chunk in symbols.chunks(WRITE_BATCH_SIZE) {
+        let mut batch = String::new();
+        for sym in chunk {
+            append_upsert_symbol(&mut batch, sym);
+        }
+        if !batch.is_empty() {
+            db.query(&batch).await.context("flush_symbol_batches")?;
+        }
+    }
+    Ok(())
+}
+
+/// Flush edges in batches of WRITE_BATCH_SIZE using text-query statements.
+async fn flush_edge_batches(
+    db: &Surreal<Db>,
+    edges: &[(QualifiedSymbol, QualifiedSymbol, EdgeKind, u32)],
+) -> Result<()> {
+    for chunk in edges.chunks(WRITE_BATCH_SIZE) {
+        let mut batch = String::new();
+        for (from, to, kind, line) in chunk {
+            append_insert_edge(&mut batch, from, to, kind, *line);
+        }
+        if !batch.is_empty() {
+            db.query(&batch).await.context("flush_edge_batches")?;
+        }
+    }
+    Ok(())
 }
 
 // ─── Transaction query builders ───────────────────────────────────────────
-
-/// Append DELETE statements for all data owned by `file`.
-fn append_delete_file_data(txn: &mut String, file: &str) {
-    let f = escape_surreal(file);
-    txn.push_str(&format!("DELETE FROM calls WHERE in_file = '{f}' OR out_file = '{f}';\n"));
-    txn.push_str(&format!("DELETE FROM uses WHERE in_file = '{f}' OR out_file = '{f}';\n"));
-    txn.push_str(&format!("DELETE FROM imports WHERE in_file = '{f}' OR out_file = '{f}';\n"));
-    txn.push_str(&format!("DELETE FROM contains WHERE in_file = '{f}' OR out_file = '{f}';\n"));
-    txn.push_str(&format!("DELETE FROM implements WHERE in_file = '{f}' OR out_file = '{f}';\n"));
-    txn.push_str(&format!("DELETE FROM symbol WHERE file = '{f}';\n"));
-    txn.push_str(&format!("DELETE FROM chunk WHERE file = '{f}';\n"));
-    txn.push_str(&format!("DELETE FROM file_meta WHERE path = '{f}';\n"));
-}
 
 /// Append an UPSERT statement for `sym`.
 fn append_upsert_symbol(txn: &mut String, sym: &Symbol) {
@@ -617,165 +650,10 @@ fn append_insert_edge(
     }
 }
 
-/// Append a CREATE chunk statement.
-fn append_insert_chunk(txn: &mut String, chunk: &crate::parsing::chunker::Chunk, emb: &[f32]) {
-    let file = escape_surreal(&chunk.file);
-    let content = escape_surreal(&chunk.content);
-    let ls = chunk.line_start as i64;
-    let le = chunk.line_end as i64;
-    let embedding = format_embedding(emb);
-    let sym_ref = chunk
-        .symbol_ref
-        .as_deref()
-        .map(|s| format!("'symbol:⟨{}⟩'", escape_surreal(s)))
-        .unwrap_or_else(|| "NONE".to_string());
-
-    txn.push_str(&format!(
-        "CREATE chunk SET file = '{file}', line_start = {ls}, line_end = {le}, \
-         content = '{content}', embedding = {embedding}, symbol_ref = {sym_ref};\n"
-    ));
-}
-
-/// Append an UPSERT file_meta statement.
-fn append_upsert_file_meta(txn: &mut String, path: &str, mtime: i64, size: i64, repo: &str) {
-    let p = escape_surreal(path);
-    let r = escape_surreal(repo);
-    txn.push_str(&format!(
-        "UPSERT file_meta SET path = '{p}', mtime = {mtime}, size = {size}, repo = '{r}' \
-         WHERE path = '{p}';\n"
-    ));
-}
-
-// ─── format_embedding correctness tests ──────────────────────────────────────
-//
-// Regression suite for the format_embedding fix.
-// Root cause investigation showed that `format!("{v}")` for f32 emits bare integer
-// tokens ("0", "1", "-0") for whole-number floats. SurrealDB's SCHEMAFULL
-// `array<float>` field accepts those via coercion today but the correct fix is to
-// always emit a float-form literal so the stored type is unambiguous.
-// The fix uses `{v:?}` (Rust Debug format for f32) which always includes either a
-// decimal point (`0.0`, `1.0`) or scientific-notation exponent (`1e-7`) — making
-// every element parseable as a SurrealQL float literal without coercion.
-#[cfg(test)]
-mod format_embedding_tests {
-    use super::*;
-    use crate::store::open_db;
-    use crate::store::ops::count_chunks;
-    use tempfile::TempDir;
-
-    /// After the fix, format_embedding must never emit bare integer tokens.
-    /// A bare integer token is a value with neither '.' nor 'e'/'E'.
-    #[test]
-    fn format_embedding_always_emits_float_literals() {
-        let cases: &[&[f32]] = &[
-            &[0.0, 1.0, -1.0, 0.5],
-            &[-0.0, 2.0, -2.0, 100.0],
-            &[0.023445, -0.987654, 0.5],
-            &[1.0e-7, -1.0e7, f32::MIN_POSITIVE],
-        ];
-        for input in cases {
-            let result = format_embedding(input);
-            println!("format_embedding({input:?}) = {result}");
-            // Each comma-separated element must contain '.' or 'e'/'E'.
-            let inner = result.trim_start_matches('[').trim_end_matches(']');
-            for token in inner.split(',') {
-                let t = token.trim();
-                assert!(
-                    t.contains('.') || t.contains('e') || t.contains('E'),
-                    "token {t:?} in {result:?} is not a float literal \
-                     (no '.' or 'e'); would be parsed as integer in SurrealQL"
-                );
-            }
-        }
-    }
-
-    /// format_embedding with whole-number floats must produce `0.0`, `1.0` etc.
-    /// (specifically checking the Debug format gives correct output).
-    #[test]
-    fn whole_number_floats_get_decimal_point() {
-        let result = format_embedding(&[0.0, 1.0, -1.0, -0.0]);
-        println!("whole-number floats: {result}");
-        assert!(result.contains("0.0"), "0.0 must appear as '0.0', got: {result}");
-        assert!(result.contains("1.0"), "1.0 must appear as '1.0', got: {result}");
-        assert!(result.contains("-1.0"), "-1.0 must appear as '-1.0', got: {result}");
-    }
-
-    /// Chunks with whole-number embedding components (0.0, 1.0) must commit and
-    /// persist when the embedding is generated via format_embedding.
-    /// This is the key regression test: before the fix, the formatted embedding
-    /// would produce integer tokens that could cause issues; after the fix,
-    /// the chunk persists correctly with proper float literals.
-    #[tokio::test]
-    async fn chunk_with_whole_number_embedding_persists() {
-        let home = TempDir::new().unwrap();
-        let db = open_db(home.path(), "/test/embed_regression").await.expect("open db");
-
-        // Use format_embedding with whole-number components — the same path as production.
-        let embedding_str = format_embedding(&[0.0, 1.0, -1.0, 0.5, -0.5]);
-        println!("REGRESSION: embedding literal = {embedding_str}");
-
-        let txn = format!(
-            "BEGIN TRANSACTION;\n\
-             CREATE chunk SET file = '/test/foo.rs', line_start = 1, line_end = 5, \
-             content = 'fn foo() {{}}', embedding = {embedding_str}, symbol_ref = NONE;\n\
-             COMMIT TRANSACTION;\n"
-        );
-
-        db.query(&txn).await.expect(".await must not err")
-            .check().expect("chunk with formatted embedding must commit without per-statement error");
-
-        let count = count_chunks(&db).await.unwrap();
-        assert_eq!(count, 1,
-            "chunk must persist after format_embedding fix (got {count}); \
-             integer token in embedding may have triggered a rollback");
-    }
-
-    /// format_embedding round-trips float precision: values stored and retrieved
-    /// should be numerically equivalent to the original f32 (within f32 precision).
-    #[tokio::test]
-    async fn format_embedding_round_trips_precision() {
-        use serde::Deserialize;
-
-        let home = TempDir::new().unwrap();
-        let db = open_db(home.path(), "/test/embed_roundtrip").await.expect("open db");
-
-        let original: Vec<f32> = vec![0.023445, -0.987654, 0.5, 0.0, 1.0, -1.0, 1.234567e-7];
-        let embedding_str = format_embedding(&original);
-        println!("ROUNDTRIP: embedding_str = {embedding_str}");
-
-        let txn = format!(
-            "BEGIN TRANSACTION;\n\
-             CREATE chunk SET file = '/test/rt.rs', line_start = 1, line_end = 1, \
-             content = 'x', embedding = {embedding_str}, symbol_ref = NONE;\n\
-             COMMIT TRANSACTION;\n"
-        );
-        db.query(&txn).await.expect(".await").check().expect(".check");
-
-        #[derive(Deserialize)]
-        struct Row { embedding: Vec<f64> }
-        let rows: Vec<Row> = db
-            .query("SELECT embedding FROM chunk LIMIT 1")
-            .await.expect("select").take(0).expect("take");
-
-        let stored = &rows.first().expect("must have a row").embedding;
-        assert_eq!(stored.len(), original.len(), "embedding length must round-trip");
-        for (i, (&orig, &stored_v)) in original.iter().zip(stored.iter()).enumerate() {
-            let diff = (orig as f64 - stored_v).abs();
-            assert!(
-                diff < 1e-6,
-                "element {i}: original={orig}, stored={stored_v}, diff={diff}; \
-                 float precision must survive format_embedding round-trip"
-            );
-        }
-        println!("ROUNDTRIP: all {} elements match within 1e-6", original.len());
-    }
-}
-
-// ─── STEP 3 regression test ───────────────────────────────────────────────
+// ─── End-to-end pipeline regression tests ────────────────────────────────
 //
 // Drives the real full_rebuild write path end-to-end (voyage = None so no
 // network) and asserts that chunks, files, and symbols all persist.
-// Also includes a voyage-scale probe for 1024-dim embeddings.
 #[cfg(test)]
 mod end_to_end_persist {
     use super::*;
@@ -818,62 +696,8 @@ mod end_to_end_persist {
         assert!(files > 0, "must have indexed files");
     }
 
-    /// VOYAGE-SCALE probe — simulate a full transaction with 1024-dim embeddings
-    /// using format_embedding, to reproduce the production rollback condition.
-    #[tokio::test]
-    async fn voyage_scale_embedding_transaction_probe() {
-        let home = TempDir::new().unwrap();
-        let db = open_db(home.path(), "/test/voyage_scale").await.expect("open db");
-
-        // Simulate Voyage AI embeddings: normalized vectors, values in (-1, 1).
-        // Use a deterministic pattern that includes whole-number components (0.0, 1.0, -1.0)
-        // alongside fractional values, matching what Voyage would actually return.
-        let make_emb = |seed: usize| -> Vec<f32> {
-            (0..1024usize).map(|i| {
-                let v = ((seed * 7 + i * 13) % 2001) as f32 / 1000.0 - 1.0;
-                v.max(-1.0_f32).min(1.0_f32)
-            }).collect()
-        };
-
-        let mut txn = String::from("BEGIN TRANSACTION;\n");
-
-        txn.push_str("UPSERT symbol:`⟨/test/s.rs::/test/s.rs::test_fn⟩` SET \
-            name = 'test_fn', kind = 'function', file = '/test/s.rs', \
-            line_start = 1, line_end = 10, signature = NONE, parent = NONE;\n");
-
-        for i in 0..50usize {
-            let emb = make_emb(i);
-            let emb_str = format_embedding(&emb);
-            txn.push_str(&format!(
-                "CREATE chunk SET file = '/test/s.rs', line_start = {ls}, line_end = {le}, \
-                 content = 'fn chunk_{i}() {{}}', embedding = {emb_str}, \
-                 symbol_ref = 'symbol:⟨/test/s.rs::/test/s.rs::test_fn⟩';\n",
-                ls = i * 10, le = i * 10 + 9
-            ));
-        }
-
-        txn.push_str("UPSERT file_meta SET path = '/test/s.rs', mtime = 12345, size = 1000, \
-            repo = '/test' WHERE path = '/test/s.rs';\n");
-        txn.push_str("COMMIT TRANSACTION;\n");
-
-        println!("VOYAGE-SCALE PROBE: txn length = {} bytes", txn.len());
-
-        let mut resp = db.query(&txn).await.expect(".await must not err");
-        let errors: Vec<_> = resp.take_errors().into_iter().collect();
-        println!("VOYAGE-SCALE PROBE: per-statement errors = {:?}", errors);
-
-        let chunk_count = count_chunks(&db).await.unwrap();
-        let symbol_count = count_symbols(&db).await.unwrap();
-        println!("VOYAGE-SCALE PROBE: chunk_count={chunk_count}, symbol_count={symbol_count}");
-        println!("VOYAGE-SCALE PROBE: RESULT — 1024-dim embedding transaction {}",
-            if errors.is_empty() && chunk_count == 50 { "COMMITS OK" }
-            else if errors.is_empty() { "NO ERROR BUT WRONG COUNTS" }
-            else { "FAILS" });
-    }
-
     /// Full-rebuild through the real IndexPipeline (voyage=None) must persist
-    /// chunks, indexed files, and symbols — proving the transaction no longer
-    /// rolls back silently.
+    /// chunks, indexed files, and symbols.
     #[tokio::test]
     async fn full_rebuild_persists_chunks_files_symbols() {
         let home = TempDir::new().unwrap();
@@ -898,7 +722,7 @@ mod end_to_end_persist {
         println!("STEP3 — chunks={chunks}, files={files}, symbols={symbols}");
 
         assert!(chunks > 0,
-            "chunks must be > 0 after full_rebuild (got {chunks}); transaction still rolling back");
+            "chunks must be > 0 after full_rebuild (got {chunks}); batched write path failed");
         assert!(files > 0,
             "indexed files must be > 0 after full_rebuild (got {files})");
         assert!(symbols > 0,
