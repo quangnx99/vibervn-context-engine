@@ -18,7 +18,7 @@ use crate::embedding::voyage::VoyageClient;
 use crate::indexing::ProgressHandle;
 use crate::indexing::events::{IndexEvent, IndexEventBus};
 use crate::indexing::tracker::{ChangeKind, FileChange, stat_file};
-use crate::indexing::walker::{is_under_hidden_dir, walk_repo};
+use crate::indexing::walker::{ChangeFilter, walk_repo};
 use crate::parsing::parse_file;
 use crate::parsing::relations::{EdgeKind, EdgeTarget};
 use crate::parsing::symbols::Symbol;
@@ -2338,23 +2338,33 @@ async fn flush_edge_batch(
     Ok(())
 }
 
-// ─── Hidden-directory change filter ──────────────────────────────────────
+// ─── Watcher change filter ────────────────────────────────────────────────
 
-/// Filter watcher-supplied file changes so that Added/Modified events for files
-/// inside dot-prefixed directories are never ingested.
+/// Filter watcher-supplied file changes down to the same set `walk_repo` would
+/// index during a full rebuild: indexable extension, not in a dot-dir, not in a
+/// `SKIP_DIRS` tree (`target/`, `node_modules/`, …), and not gitignored.
 ///
-/// Deleted changes are always allowed through — they clean up any stale entries
-/// that were indexed before this rule existed (self-healing behavior).
+/// The watcher emits raw filesystem events for every touched path, so without
+/// this filter, build artifacts (e.g. `target/debug/*.exe`, `*.d`) written by a
+/// concurrent `cargo build` get indexed and surface in query results — even
+/// though a full rebuild correctly excludes them. This is the source of the
+/// "gitignored files appear in results until a `--rebuild`" bug.
+///
+/// Deleted changes are ALWAYS allowed through regardless of the rules above, so
+/// any artifact that a previous (unfiltered) watcher run indexed is cleaned up
+/// when it is later removed — self-healing without requiring a full rebuild.
 pub(crate) fn filter_hidden_changes(repo: &std::path::Path, changes: Vec<FileChange>) -> Vec<FileChange> {
+    let filter = ChangeFilter::new(repo);
     changes
         .into_iter()
         .filter(|c| {
-            // Always allow Deleted changes through (self-heal stale dot-dir entries).
+            // Always allow Deleted changes through (self-heal stale entries that
+            // a previous unfiltered watcher run may have indexed).
             if c.kind == ChangeKind::Deleted {
                 return true;
             }
-            // Drop Added/Modified if the path is inside a dot-prefixed directory.
-            !is_under_hidden_dir(repo, std::path::Path::new(&c.path))
+            // Drop Added/Modified unless the path passes the full walk_repo rule set.
+            filter.allows(std::path::Path::new(&c.path))
         })
         .collect()
 }
@@ -3573,6 +3583,79 @@ mod hidden_change_filter_tests {
             filtered.len(),
             3,
             "expected 3 changes to survive; got: {:?}",
+            filtered.iter().map(|c| (&c.path, &c.kind)).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression: watcher-supplied changes for gitignored build artifacts under
+    /// `target/` must be dropped (Added/Modified), matching what `walk_repo` does
+    /// on a full rebuild. Previously only dot-dirs were filtered, so a concurrent
+    /// `cargo build` leaked `target/debug/*.exe` / `*.d` into query results until
+    /// the next `--rebuild`. Deleted changes for those artifacts still pass through
+    /// so a previously-indexed artifact self-heals when removed.
+    #[test]
+    fn filter_drops_gitignored_target_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // A .gitignore that excludes the target/ tree (mirrors the real repo).
+        std::fs::write(root.join(".gitignore"), "/target\n").unwrap();
+
+        // Real source that must survive.
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src_main = src_dir.join("main.rs");
+        std::fs::File::create(&src_main).unwrap();
+
+        // Build artifacts under target/ — gitignored AND in SKIP_DIRS.
+        let target_dir = root.join("target").join("debug");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let exe = target_dir.join("context-engine-rs.exe");
+        let dep = target_dir.join("context-engine-rs.d");
+        std::fs::File::create(&exe).unwrap();
+        std::fs::File::create(&dep).unwrap();
+        // A .rs file under target/ must ALSO be dropped (gitignore/SKIP_DIRS win
+        // even though the extension is indexable).
+        let gen_rs = target_dir.join("generated.rs");
+        std::fs::File::create(&gen_rs).unwrap();
+
+        let changes = vec![
+            FileChange { path: src_main.to_str().unwrap().to_string(), kind: ChangeKind::Modified },
+            FileChange { path: exe.to_str().unwrap().to_string(), kind: ChangeKind::Added },
+            FileChange { path: dep.to_str().unwrap().to_string(), kind: ChangeKind::Modified },
+            FileChange { path: gen_rs.to_str().unwrap().to_string(), kind: ChangeKind::Added },
+            // Deleted artifact: must survive so a previously-indexed entry is cleaned up.
+            FileChange { path: exe.to_str().unwrap().to_string(), kind: ChangeKind::Deleted },
+        ];
+
+        let filtered = filter_hidden_changes(root, changes);
+
+        // src/main.rs survives.
+        assert!(
+            filtered.iter().any(|c| c.path.ends_with("main.rs") && c.kind == ChangeKind::Modified),
+            "src/main.rs Modified must survive; got: {:?}",
+            filtered.iter().map(|c| (&c.path, &c.kind)).collect::<Vec<_>>()
+        );
+
+        // No Added/Modified target/ artifact survives (exe, .d, generated.rs all dropped).
+        assert!(
+            !filtered.iter().any(|c| c.path.contains("target") && c.kind != ChangeKind::Deleted),
+            "no Added/Modified target/ artifact may survive; got: {:?}",
+            filtered.iter().map(|c| (&c.path, &c.kind)).collect::<Vec<_>>()
+        );
+
+        // The Deleted artifact survives (self-heal).
+        assert!(
+            filtered.iter().any(|c| c.path.contains("target") && c.kind == ChangeKind::Deleted),
+            "Deleted target/ artifact must survive for self-heal; got: {:?}",
+            filtered.iter().map(|c| (&c.path, &c.kind)).collect::<Vec<_>>()
+        );
+
+        // Surviving: src/main.rs + the one Deleted artifact = 2.
+        assert_eq!(
+            filtered.len(),
+            2,
+            "expected exactly 2 changes to survive; got: {:?}",
             filtered.iter().map(|c| (&c.path, &c.kind)).collect::<Vec<_>>()
         );
     }

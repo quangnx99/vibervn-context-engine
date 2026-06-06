@@ -1,6 +1,7 @@
 use std::path::{Component, Path};
 
-use ignore::WalkBuilder;
+use ignore::gitignore::GitignoreBuilder;
+use ignore::{Match, WalkBuilder};
 use tracing::debug;
 
 /// Extensions considered indexable code/config.
@@ -42,6 +43,106 @@ pub fn is_under_hidden_dir(repo_root: &Path, path: &Path) -> bool {
         }
     }
     false
+}
+
+/// Returns true if `path` has an extension (or extension-less filename, e.g.
+/// `Dockerfile`/`Makefile`/`justfile`) considered indexable code/config.
+///
+/// This is the single source of truth for the file-type allowlist, shared by
+/// the full-rebuild `walk_repo` and the watcher-driven incremental change filter
+/// so both paths index exactly the same set of file types.
+pub fn has_indexable_extension(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        return CODE_EXTENSIONS.contains(&ext.to_lowercase().as_str());
+    }
+    // No extension — allow a small set of well-known extension-less files.
+    let fname = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    matches!(fname.as_str(), "dockerfile" | "makefile" | "justfile")
+}
+
+/// Returns true if any directory component of `path` relative to `repo_root` is
+/// in `SKIP_DIRS` (e.g. `target`, `node_modules`, `build`). The file's own
+/// basename is not treated as a directory. Mirrors the `filter_entry` directory
+/// pruning that `walk_repo` performs, so the watcher path skips the same trees.
+pub fn is_under_skip_dir(repo_root: &Path, path: &Path) -> bool {
+    let relative = match path.strip_prefix(repo_root) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let components: Vec<_> = relative.components().collect();
+    let dir_components = if components.is_empty() {
+        &[][..]
+    } else {
+        &components[..components.len() - 1]
+    };
+    for component in dir_components {
+        if let Component::Normal(name) = component
+            && let Some(s) = name.to_str()
+            && SKIP_DIRS.contains(&s)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reusable filter that applies the full `walk_repo` rule set to many paths
+/// while building the gitignore matcher exactly once.
+///
+/// The full-rebuild `walk_repo` gets dot-dir, SKIP_DIRS, and gitignore handling
+/// for free from the `ignore` crate's `WalkBuilder`. The watcher, by contrast,
+/// feeds raw filesystem paths that never went through that walk — so without
+/// this filter, build artifacts under a gitignored dir (e.g. `target/*.exe`)
+/// leak into the index on every incremental run. This re-applies the same rules
+/// so the watcher and full-rebuild paths agree on which files exist.
+///
+/// The watcher debounces filesystem events into a batch that can contain
+/// hundreds of paths (e.g. a `cargo build` rewriting `target/`). Rebuilding the
+/// gitignore matcher per path would re-read `.gitignore` from disk O(batch)
+/// times; this struct reads it once and reuses the compiled matcher, keeping the
+/// batch filter O(batch) with a single disk read.
+pub struct ChangeFilter {
+    repo_root: std::path::PathBuf,
+    gitignore: ignore::gitignore::Gitignore,
+}
+
+impl ChangeFilter {
+    /// Build the filter for `repo_root`, compiling its `.gitignore` / `.ignore`
+    /// rules once. A missing or malformed ignore file degrades to a matcher that
+    /// excludes nothing (the other predicates still apply).
+    pub fn new(repo_root: &Path) -> Self {
+        let mut builder = GitignoreBuilder::new(repo_root);
+        let _ = builder.add(repo_root.join(".gitignore"));
+        let _ = builder.add(repo_root.join(".ignore"));
+        let gitignore = builder.build().unwrap_or_else(|e| {
+            debug!(error = %e, "failed to build gitignore matcher; nothing will be gitignore-excluded");
+            ignore::gitignore::Gitignore::empty()
+        });
+        Self {
+            repo_root: repo_root.to_path_buf(),
+            gitignore,
+        }
+    }
+
+    /// Returns true if `path` passes every indexability rule (extension, dot-dir,
+    /// SKIP_DIRS, gitignore) and should therefore be indexed.
+    pub fn allows(&self, path: &Path) -> bool {
+        if !has_indexable_extension(path)
+            || is_under_hidden_dir(&self.repo_root, path)
+            || is_under_skip_dir(&self.repo_root, path)
+        {
+            return false;
+        }
+        let is_dir = path.is_dir();
+        !matches!(
+            self.gitignore.matched_path_or_any_parents(path, is_dir),
+            Match::Ignore(_)
+        )
+    }
 }
 
 /// Walk a repository directory and return all indexable file paths.
@@ -88,24 +189,9 @@ pub fn walk_repo(repo_path: &str) -> Vec<String> {
                     continue;
                 }
                 let path = entry.path();
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if CODE_EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
-                        debug!(path = ?path, "discovered file");
-                        if let Some(s) = path.to_str() {
-                            files.push(s.to_string());
-                        }
-                    }
-                } else {
-                    // No extension — check filename (e.g. "Dockerfile")
-                    let fname = path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    if (fname == "dockerfile"
-                        || fname == "makefile"
-                        || fname == "justfile")
-                        && let Some(s) = path.to_str()
-                    {
+                if has_indexable_extension(path) {
+                    debug!(path = ?path, "discovered file");
+                    if let Some(s) = path.to_str() {
                         files.push(s.to_string());
                     }
                 }
@@ -259,6 +345,128 @@ mod tests {
         assert!(
             is_under_hidden_dir(root, &c_rs),
             "a/.b/c.rs must be under a hidden dir"
+        );
+    }
+
+    /// Isolates the GITIGNORE branch of `ChangeFilter::allows`. The candidate
+    /// file has an indexable extension (.rs), is NOT in a dot-dir, and is NOT in
+    /// any SKIP_DIRS tree — so the only thing that can exclude it is the custom
+    /// `.gitignore` pattern. This proves the gitignore matcher is actually the
+    /// deciding predicate, which the `target/*.exe` regression test does NOT
+    /// (those are killed earlier by the extension allowlist / SKIP_DIRS).
+    #[test]
+    fn change_filter_gitignore_branch_is_decisive() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Custom ignore pattern that is NOT a SKIP_DIR and NOT a dot-dir:
+        // a top-level "generated/" folder of .rs files.
+        fs::write(root.join(".gitignore"), "/generated\nsecret.rs\n").unwrap();
+
+        touch(root, "src/keep.rs");
+        touch(root, "generated/leak.rs"); // excluded only by /generated
+        touch(root, "secret.rs"); // excluded only by the bare pattern
+
+        let filter = ChangeFilter::new(root);
+
+        // Real source survives (no rule excludes it).
+        assert!(
+            filter.allows(&root.join("src").join("keep.rs")),
+            "src/keep.rs must pass — no rule excludes it"
+        );
+        // gitignored dir: only the gitignore matcher can catch this (.rs ext is
+        // indexable, "generated" is not in SKIP_DIRS, not a dot-dir).
+        assert!(
+            !filter.allows(&root.join("generated").join("leak.rs")),
+            "generated/leak.rs must be dropped by the gitignore branch"
+        );
+        // gitignored bare filename pattern.
+        assert!(
+            !filter.allows(&root.join("secret.rs")),
+            "secret.rs must be dropped by the gitignore branch"
+        );
+    }
+
+    /// The watcher feeds OS-native paths (backslashes on Windows) while the repo
+    /// root from config may use forward slashes. If `ChangeFilter` can't reconcile
+    /// the two, the gitignore branch silently becomes a no-op in production and
+    /// the whole fix regresses even though the test above (same separators) passes.
+    ///
+    /// This test builds the filter with a forward-slash root and queries it with
+    /// a candidate path joined the OS-native way (what notify actually delivers),
+    /// matching the real `incremental_run` path-form mismatch.
+    #[test]
+    fn change_filter_matches_across_separator_forms() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join(".gitignore"), "/generated\n").unwrap();
+        touch(root, "generated/leak.rs");
+        touch(root, "src/keep.rs");
+
+        // Root in forward-slash form (as config / self.repo stores it).
+        let root_fwd = root.to_str().unwrap().replace('\\', "/");
+        let filter = ChangeFilter::new(Path::new(&root_fwd));
+
+        // Candidate as the OS delivers it (PathBuf::join → native separators).
+        let leak_native = root.join("generated").join("leak.rs");
+        let keep_native = root.join("src").join("keep.rs");
+
+        assert!(
+            !filter.allows(&leak_native),
+            "gitignored path must be dropped regardless of root/candidate separator form; \
+             root={root_fwd:?} candidate={leak_native:?}"
+        );
+        assert!(
+            filter.allows(&keep_native),
+            "non-ignored path must pass regardless of separator form; candidate={keep_native:?}"
+        );
+    }
+
+    /// The PRODUCTION bug — `target/*` artifacts — is caught by the SKIP_DIRS
+    /// branch (`is_under_skip_dir`), NOT the gitignore branch: gitignore only runs
+    /// after extension passes AND the path is not already in a skip dir. That
+    /// branch uses `Path::strip_prefix`, a different mechanism than the `ignore`
+    /// crate's matcher — so it needs its OWN proof that it survives the Windows
+    /// separator mismatch (fwd-slash root from config vs native-separator path
+    /// from notify). If `strip_prefix` fails to reconcile them it returns Err →
+    /// `is_under_skip_dir` returns false → the artifact leaks. Prove it doesn't.
+    ///
+    /// Uses a `.rs` file under `target/` so the EXTENSION check (step 1) passes and
+    /// SKIP_DIRS (step 3) is the predicate under test — a `.exe` would short-circuit
+    /// at step 1 and never reach this branch, defeating the point.
+    #[test]
+    fn change_filter_skip_dir_survives_separator_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // No .gitignore at all — isolate the SKIP_DIRS branch from gitignore.
+        touch(root, "target/debug/generated.rs");
+        touch(root, "src/keep.rs");
+
+        // Root in forward-slash form (as config / self.repo stores it).
+        let root_fwd = root.to_str().unwrap().replace('\\', "/");
+        let filter = ChangeFilter::new(Path::new(&root_fwd));
+
+        // Candidate as notify delivers it (PathBuf::join → native separators).
+        let artifact_native = root.join("target").join("debug").join("generated.rs");
+        let keep_native = root.join("src").join("keep.rs");
+
+        // Sanity: prove strip_prefix actually reconciles the two forms here.
+        // If this fails, is_under_skip_dir's Err arm fires and the assert below
+        // would silently pass for the WRONG reason — so check it explicitly.
+        assert!(
+            is_under_skip_dir(Path::new(&root_fwd), &artifact_native),
+            "is_under_skip_dir must reconcile fwd-slash root vs native candidate; \
+             root={root_fwd:?} candidate={artifact_native:?}"
+        );
+
+        assert!(
+            !filter.allows(&artifact_native),
+            "target/debug/generated.rs (.rs ext, no .gitignore) must be dropped by the \
+             SKIP_DIRS branch across separator forms; root={root_fwd:?} candidate={artifact_native:?}"
+        );
+        assert!(
+            filter.allows(&keep_native),
+            "src/keep.rs must still pass; candidate={keep_native:?}"
         );
     }
 }
