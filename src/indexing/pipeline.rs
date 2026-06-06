@@ -8,6 +8,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
+use surrealdb::sql::{Array as SqlArray, Id as SqlId, Object as SqlObject, Thing as SqlThing, Value as SqlValue};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -150,6 +151,14 @@ pub struct IndexPipelineStats {
     pub cache_hit_chunks: u64,
     /// Number of chunks that were NOT in the cache (re-embedded or stored empty).
     pub cache_miss_chunks: u64,
+    /// Sub-term: time spent in the actual db.query INSERT for chunks (milliseconds).
+    pub stage3_chunk_db_ms: u64,
+    /// Sub-term: time spent constructing ChunkRecord structs + pushing to Vec (milliseconds).
+    pub stage3_chunk_cpu_ms: u64,
+    /// Time spent dropping idx_chunk_file before bulk chunk write (full rebuild only, ms).
+    pub stage3_chunk_idx_drop_ms: u64,
+    /// Time spent rebuilding idx_chunk_file after bulk chunk write (full rebuild only, ms).
+    pub stage3_chunk_idx_rebuild_ms: u64,
 }
 
 /// Key used to track whether Phase 2 (raw edge resolution) has completed.
@@ -312,6 +321,10 @@ impl IndexPipeline {
                 stage3_sym_ms = stage_stats.stage3_sym_ms,
                 stage3_rawedge_ms = stage_stats.stage3_rawedge_ms,
                 stage3_chunk_ms = stage_stats.stage3_chunk_ms,
+                stage3_chunk_db_ms = stage_stats.stage3_chunk_db_ms,
+                stage3_chunk_cpu_ms = stage_stats.stage3_chunk_cpu_ms,
+                stage3_chunk_idx_drop_ms = stage_stats.stage3_chunk_idx_drop_ms,
+                stage3_chunk_idx_rebuild_ms = stage_stats.stage3_chunk_idx_rebuild_ms,
                 stage3_filemeta_ms = stage_stats.stage3_filemeta_ms,
                 phase2_ms = stage_stats.phase2_ms,
                 embed_total_ms = stage_stats.embed_total_ms,
@@ -338,6 +351,10 @@ impl IndexPipeline {
                 embed_total_ms: stage_stats.embed_total_ms,
                 cache_hit_chunks: stage_stats.cache_hit_chunks,
                 cache_miss_chunks: stage_stats.cache_miss_chunks,
+                stage3_chunk_db_ms: stage_stats.stage3_chunk_db_ms,
+                stage3_chunk_cpu_ms: stage_stats.stage3_chunk_cpu_ms,
+                stage3_chunk_idx_drop_ms: stage_stats.stage3_chunk_idx_drop_ms,
+                stage3_chunk_idx_rebuild_ms: stage_stats.stage3_chunk_idx_rebuild_ms,
             });
         }
 
@@ -371,12 +388,53 @@ impl IndexPipeline {
 
         if file_changes.is_empty() {
             debug!(repo = %self.repo, "no changes detected");
-            // Check if edges_resolved marker is missing — replay Phase 2.
+            // Check if edges_resolved marker is missing.
             let resolved = get_meta(db, EDGES_RESOLVED_KEY).await?.is_some();
             if !resolved {
-                info!(repo = %self.repo, "edges_resolved marker absent — replaying Phase 2");
-                self.resolve_edges_phase2(db).await
-                    .context("edges Phase 2 replay on no-change run")?;
+                // Check how many raw_edges are in the DB.
+                // If raw_edge is empty but file_meta is present, this is the crash
+                // scenario for the RAM-path full rebuild: Stage 3 completed with raw_edges
+                // buffered in RAM (never written to DB), but the process died before
+                // Phase 2 completed.  We cannot replay Phase 2 from DB (no raw_edges
+                // there), so we must force a full rebuild.
+                use serde::Deserialize;
+                #[derive(Deserialize)]
+                struct CountRow { count: i64 }
+                let raw_edge_count: Vec<CountRow> = db
+                    .query("SELECT count() AS count FROM raw_edge GROUP ALL")
+                    .await
+                    .context("crash-recovery: count raw_edge")?
+                    .take(0)?;
+                let raw_edge_total = raw_edge_count.first().map(|r| r.count).unwrap_or(0);
+
+                if raw_edge_total == 0 && !stored_meta.is_empty() {
+                    // RAM-path crash: Stage 3 completed, Phase 2 never ran, no DB raw_edges.
+                    // Force a full rebuild to regenerate calls edges.
+                    warn!(
+                        repo = %self.repo,
+                        "RAM-path crash detected (edges_resolved absent, raw_edge empty, file_meta present) \
+                         — forcing full rebuild to recover calls edges"
+                    );
+                    let (new_vectors, stage_stats) = self.full_rebuild(db, None, event_bus, key_hints).await?;
+                    if let Some(vi) = vector_index {
+                        let mut guard = vi.write().await;
+                        guard.remove_repo(&self.repo);
+                        guard.insert(&new_vectors);
+                    }
+                    let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
+                    let total_files = stored_meta.len() as u64;
+                    return Ok(IndexPipelineStats {
+                        indexed_files: indexed,
+                        total_files,
+                        phase2_ms: stage_stats.phase2_ms,
+                        ..Default::default()
+                    });
+                } else {
+                    // Normal Phase 2 replay: raw_edges are in DB (overflow path or incremental).
+                    info!(repo = %self.repo, raw_edge_total, "edges_resolved marker absent — replaying Phase 2 from DB");
+                    self.resolve_edges_phase2(db).await
+                        .context("edges Phase 2 replay on no-change run")?;
+                }
             }
             let indexed = stored_meta.len() as u64;
             let total_files = stored_meta.len() as u64;
@@ -431,12 +489,12 @@ impl IndexPipeline {
             .await;
 
         // Stream parse → embed → write with bounded channels.
-        // Raw edges are written to the `raw_edge` DB table during Stage 3 (same as
-        // the incremental path), providing crash-safe replay in Phase 2 and keeping
-        // memory bounded (symbol map + one raw_edge page + one edge batch), independent
-        // of total edge count.
-        let (chunk_vectors, mut stats) = self
-            .streaming_index(&all_files, db, progress, event_bus, key_hints)
+        // Raw edges are buffered in RAM (bounded by MAX_RAM_EDGES) when possible,
+        // avoiding a DB write + read round-trip (~27s for notepad-ade).
+        // If the repo exceeds MAX_RAM_EDGES, edges overflow to the DB and Phase 2
+        // falls back to the keyset scan path (same as before).
+        let (chunk_vectors, mut stats, ram_raw_edges, ram_edges_overflowed) = self
+            .streaming_index(&all_files, db, progress, event_bus, key_hints, true)
             .await
             .context("full_rebuild: streaming_index")?;
 
@@ -445,9 +503,17 @@ impl IndexPipeline {
             bus.emit(IndexEvent::Phase2Start { repo: self.repo.clone() });
         }
         let phase2_start = Instant::now();
-        self.resolve_edges_phase2(db)
-            .await
-            .context("full_rebuild: resolve_edges_phase2")?;
+        if !ram_edges_overflowed && !ram_raw_edges.is_empty() {
+            // Fast path: all raw_edges are in RAM — skip DB scan entirely.
+            self.resolve_edges_from_ram(db, ram_raw_edges)
+                .await
+                .context("full_rebuild: resolve_edges_from_ram")?;
+        } else {
+            // DB path: overflow or incremental — use keyset scan as before.
+            self.resolve_edges_phase2(db)
+                .await
+                .context("full_rebuild: resolve_edges_phase2")?;
+        }
         let phase2_ms = phase2_start.elapsed().as_millis() as u64;
         stats.phase2_ms = phase2_ms;
         if let Some(bus) = event_bus {
@@ -516,8 +582,8 @@ impl IndexPipeline {
 
         // Stream parse → embed → write.
         // Raw edges go to DB (crash-safe incremental path).
-        let (chunk_vectors, _stage_stats) = self
-            .streaming_index(&to_process, db, progress, event_bus, key_hints)
+        let (chunk_vectors, _stage_stats, _ram_edges, _overflowed) = self
+            .streaming_index(&to_process, db, progress, event_bus, key_hints, false)
             .await
             .context("incremental_run: streaming_index")?;
 
@@ -556,10 +622,11 @@ impl IndexPipeline {
     /// Peak inflight = PARSE_CHANNEL_CAP + EMBED_CHANNEL_CAP parsed/embedded files
     /// (O(channels * chunks_per_file)), independent of total repo size.
     ///
-    /// Raw edges are always written to the `raw_edge` DB table (both full-rebuild and
-    /// incremental paths). Phase 2 reads them back via O(N) file-keyset pagination,
-    /// keeping peak memory bounded: symbol map + one raw_edge page + one edge batch,
-    /// independent of total raw_edge count and safe at Linux/Chromium scale.
+    /// For full rebuilds: raw_edges are buffered in RAM (up to MAX_RAM_EDGES) to
+    /// avoid a DB write+read round-trip.  If the repo exceeds the cap, edges overflow
+    /// to the `raw_edge` DB table and Phase 2 falls back to the keyset scan path.
+    /// For incremental builds: raw_edges always go to the `raw_edge` DB table for
+    /// crash-safe Phase 2 replay.
     async fn streaming_index(
         &self,
         files: &[String],
@@ -567,13 +634,14 @@ impl IndexPipeline {
         progress: Option<&ProgressHandle>,
         event_bus: Option<&IndexEventBus>,
         key_hints: &[String],
-    ) -> Result<(Vec<(ChunkId, Vec<f32>)>, IndexPipelineStats)> {
+        is_full_rebuild: bool,
+    ) -> Result<(Vec<(ChunkId, Vec<f32>)>, IndexPipelineStats, Vec<RawEdgeRecord>, bool)> {
         if files.is_empty() {
             if let Some(ph) = progress {
                 ph.set_run_total(0).await;
                 ph.set_processed(0).await;
             }
-            return Ok((vec![], IndexPipelineStats::default()));
+            return Ok((vec![], IndexPipelineStats::default(), vec![], false));
         }
 
         let total_files = files.len() as u64;
@@ -739,6 +807,10 @@ impl IndexPipeline {
         let mut sym_ns: u64 = 0;
         let mut rawedge_ns: u64 = 0;
         let mut chunk_ns: u64 = 0;
+        // Sub-term: nanoseconds spent actually awaiting the DB INSERT.
+        let mut chunk_db_ns: u64 = 0;
+        // Sub-term: nanoseconds spent building ChunkRecord structs + pushing to Vec.
+        let mut chunk_cpu_ns: u64 = 0;
         let mut filemeta_ns: u64 = 0;
         let mut total_chunks_count: u64 = 0;
         let mut total_symbols_count: u64 = 0;
@@ -759,6 +831,22 @@ impl IndexPipeline {
         // Reduces symbol write round-trips from O(files) to O(total_symbols/SYM_BATCH_SIZE).
         const SYM_BATCH_SIZE: usize = 2048;
         let mut pending_symbol_batch: Vec<Symbol> = Vec::with_capacity(SYM_BATCH_SIZE);
+
+        // Full-rebuild optimisation: buffer raw_edges in RAM (up to MAX_RAM_EDGES).
+        // Avoids writing/reading raw_edges from DB (saves ~27s for notepad-ade).
+        // If the repo exceeds MAX_RAM_EDGES, the buffer is flushed to DB and
+        // `ram_edges_overflowed` is set — Phase 2 falls back to the DB scan path.
+        // Memory bound: MAX_RAM_EDGES × ~200 bytes (constant, independent of repo size
+        // for repos that fit; for larger repos the DB path is used instead).
+        // NOT used for incremental (few edges, existing DB path is already fast).
+        const MAX_RAM_EDGES: usize = 200_000;
+        let mut ram_raw_edges: Vec<RawEdgeRecord> = if is_full_rebuild {
+            Vec::with_capacity(std::cmp::min(4096, MAX_RAM_EDGES))
+        } else {
+            Vec::new()
+        };
+        // Once the RAM buffer overflows, all subsequent raw_edges go to DB.
+        let mut ram_edges_overflowed = false;
 
         while let Some(ef) = embed_rx.recv().await {
             // Measure queue wait: time from when EmbeddedFile was created in Stage 2
@@ -786,19 +874,49 @@ impl IndexPipeline {
             // ── raw edges ──────────────────────────────────────────────
             let t1 = Instant::now();
             total_raw_edges_count += ef.raw_edges.len() as u64;
-            // Persist to DB for Phase-2 file-keyset scan. Both full-rebuild and
-            // incremental paths write raw edges here; Phase 2 reads them back in
-            // O(N) bounded pages. This is the crash-safe anchor: if the process
-            // dies after Stage 3 but before Phase 2 completes, the next run
-            // detects the absent `edges_resolved` marker and replays Phase 2.
-            flush_raw_edge_batch_native(db, &ef.raw_edges)
-                .await
-                .context("streaming_index: raw_edges")?;
+            // Full-rebuild path: buffer raw_edges in RAM (bounded by MAX_RAM_EDGES).
+            // This avoids a DB write + read round-trip (~27s for notepad-ade).
+            // If the buffer overflows, flush everything to DB and continue with DB path.
+            // Incremental path: always write to DB (crash-safe anchor for Phase 2 replay).
+            if is_full_rebuild && !ram_edges_overflowed {
+                let new_total = ram_raw_edges.len() + ef.raw_edges.len();
+                if new_total <= MAX_RAM_EDGES {
+                    // Buffer in RAM — no DB write.
+                    ram_raw_edges.extend(ef.raw_edges.iter().cloned());
+                } else {
+                    // RAM cap exceeded: flush all accumulated edges to DB and stop buffering.
+                    info!(
+                        buffered = ram_raw_edges.len(),
+                        new_edges = ef.raw_edges.len(),
+                        "stage3: RAM raw_edge buffer full — flushing to DB"
+                    );
+                    // Flush the entire RAM buffer to DB first.
+                    if !ram_raw_edges.is_empty() {
+                        flush_raw_edge_batch_native(db, &std::mem::take(&mut ram_raw_edges))
+                            .await
+                            .context("streaming_index: ram_raw_edges flush on overflow")?;
+                    }
+                    // Flush current file's edges to DB.
+                    flush_raw_edge_batch_native(db, &ef.raw_edges)
+                        .await
+                        .context("streaming_index: raw_edges (overflow)")?;
+                    ram_edges_overflowed = true;
+                }
+            } else {
+                // Incremental path or post-overflow: write to DB as before.
+                // Crash-safe anchor: if process dies after Stage 3 but before Phase 2
+                // completes, the next run detects the absent `edges_resolved` marker
+                // and replays Phase 2 from the raw_edge DB table.
+                flush_raw_edge_batch_native(db, &ef.raw_edges)
+                    .await
+                    .context("streaming_index: raw_edges")?;
+            }
             rawedge_ns += t1.elapsed().as_nanos() as u64;
 
             // ── chunks (cross-file batched) ────────────────────────────
             // Accumulate this file's chunks into the cross-file buffer.
             // Flush only when the buffer fills, to batch INSERT round-trips.
+            // chunk_ns = total; chunk_cpu_ns = record construction; chunk_db_ns = DB INSERT await.
             let t2 = Instant::now();
             let file_chunk_count = ef.chunks.len() as i64;
             total_chunks_count += ef.chunks.len() as u64;
@@ -806,6 +924,8 @@ impl IndexPipeline {
             for (chunk, emb) in ef.chunks.iter().zip(
                 ef.embeddings.iter().cloned().chain(std::iter::repeat(vec![]))
             ) {
+                // (a) CPU: construct ChunkRecord and push to vector index accumulator.
+                let t_cpu = Instant::now();
                 all_chunk_vectors.push((
                     ChunkId {
                         file: chunk.file.clone(),
@@ -822,11 +942,16 @@ impl IndexPipeline {
                     embedding: emb,
                     symbol_ref: chunk.symbol_ref.as_ref().map(|fqn| format!("symbol:⟨{fqn}⟩")),
                 });
+                chunk_cpu_ns += t_cpu.elapsed().as_nanos() as u64;
+
                 // Flush when the cross-file buffer is full.
                 if pending_chunk_batch.len() >= WRITE_BATCH_SIZE {
+                    // (b) DB: actual INSERT await.
+                    let t_db = Instant::now();
                     flush_chunk_batch(db, std::mem::take(&mut pending_chunk_batch))
                         .await
                         .context("streaming_index: cross-file chunk batch")?;
+                    chunk_db_ns += t_db.elapsed().as_nanos() as u64;
                     // Commit all deferred file_metas accumulated so far.
                     let t_fm = Instant::now();
                     for fm in std::mem::take(&mut pending_file_metas) {
@@ -889,9 +1014,11 @@ impl IndexPipeline {
         }
         if !pending_chunk_batch.is_empty() {
             let t2 = Instant::now();
+            let t_db = Instant::now();
             flush_chunk_batch(db, pending_chunk_batch)
                 .await
                 .context("streaming_index: tail chunk batch")?;
+            chunk_db_ns += t_db.elapsed().as_nanos() as u64;
             chunk_ns += t2.elapsed().as_nanos() as u64;
         }
         if !pending_file_metas.is_empty() {
@@ -908,15 +1035,22 @@ impl IndexPipeline {
         let sym_ms = sym_ns / 1_000_000;
         let rawedge_ms = rawedge_ns / 1_000_000;
         let chunk_ms = chunk_ns / 1_000_000;
+        let chunk_db_ms = chunk_db_ns / 1_000_000;
+        let chunk_cpu_ms = chunk_cpu_ns / 1_000_000;
         let filemeta_ms = filemeta_ns / 1_000_000;
+        let ram_edges_in_buf = ram_raw_edges.len() as u64;
 
         info!(
             stage3_total_ms,
             sym_ms,
             rawedge_ms,
             chunk_ms,
+            chunk_db_ms,
+            chunk_cpu_ms,
             filemeta_ms,
             embed_total_ms,
+            ram_edges_buffered = ram_edges_in_buf,
+            ram_edges_overflowed,
             cache_hit_chunks = total_cache_hit_chunks,
             cache_miss_chunks = total_cache_miss_chunks,
             files = total_files,
@@ -941,9 +1075,13 @@ impl IndexPipeline {
             embed_total_ms,
             cache_hit_chunks: total_cache_hit_chunks,
             cache_miss_chunks: total_cache_miss_chunks,
+            stage3_chunk_db_ms: chunk_db_ms,
+            stage3_chunk_cpu_ms: chunk_cpu_ms,
+            stage3_chunk_idx_drop_ms: 0,
+            stage3_chunk_idx_rebuild_ms: 0,
         };
 
-        Ok((all_chunk_vectors, stats))
+        Ok((all_chunk_vectors, stats, ram_raw_edges, ram_edges_overflowed))
     }
 
     // ─── Phase 2: batched edge resolution ────────────────────────────────
@@ -1258,6 +1396,143 @@ impl IndexPipeline {
             .context("phase2: set edges_resolved marker")?;
 
         info!(repo = %self.repo, "Phase 2 edge resolution complete");
+        Ok(())
+    }
+
+    // ─── RAM-path Phase 2: resolve pre-buffered edges without DB scan ─────
+
+    /// Resolve raw edges from a pre-built RAM buffer (full-rebuild fast path).
+    ///
+    /// This avoids the 9.6s raw_edge DB write + 17.5s DB scan that the keyset
+    /// scan path (`resolve_edges_phase2`) requires.  Applicable only when all
+    /// raw_edges fit in RAM (bounded by MAX_RAM_EDGES = 200K); falls back to
+    /// `resolve_edges_phase2` for larger repos.
+    ///
+    /// Crash-safety note: raw_edges are NOT in the DB when this path is taken.
+    /// If the process crashes AFTER Stage 3 (all file_meta committed) but BEFORE
+    /// this function completes:
+    ///
+    /// - `edges_resolved` marker is absent
+    /// - `raw_edge` table is empty
+    /// - file_meta is present and current
+    ///
+    /// On next `run()` call, no changes are detected, `edges_resolved` is absent,
+    /// Phase 2 replay is triggered, finds 0 raw_edges, and would set `edges_resolved=1`
+    /// with an empty calls table.
+    ///
+    /// To avoid silent data loss, `run()` detects this state
+    /// (`raw_edge_count=0 AND file_meta non-empty AND edges_resolved absent`)
+    /// and forces a full rebuild.
+    async fn resolve_edges_from_ram(
+        &self,
+        db: &Surreal<Db>,
+        raw_edges: Vec<RawEdgeRecord>,
+    ) -> Result<()> {
+        let total = raw_edges.len();
+        info!(repo = %self.repo, total_raw_edges = total, "phase2(ram): starting in-RAM edge resolution");
+
+        if total == 0 {
+            set_meta(db, EDGES_RESOLVED_KEY, "1")
+                .await
+                .context("phase2(ram): set edges_resolved marker (empty)")?;
+            return Ok(());
+        }
+
+        // Load ALL symbols into memory at once — same as the DB-scan Phase 2 path.
+        let t_sym_load = Instant::now();
+        let all_symbols = load_all_symbols(db).await.context("phase2(ram): load all symbols")?;
+        let sym_load_ms = t_sym_load.elapsed().as_millis();
+        info!(repo = %self.repo, symbol_count = all_symbols.len(), sym_load_ms, "phase2(ram): loaded all symbols");
+
+        // Build name → Vec<SymbolWithPos> map for O(1) resolution.
+        let mut name_bucket: HashMap<String, Vec<SymbolWithPos>> = HashMap::new();
+        for s in all_symbols {
+            name_bucket.entry(s.name.clone()).or_default().push(s);
+        }
+        for bucket in name_bucket.values_mut() {
+            bucket.sort_unstable_by(|a, b| {
+                a.file.cmp(&b.file)
+                    .then(a.line_start.cmp(&b.line_start))
+                    .then(a.line_end.cmp(&b.line_end))
+            });
+        }
+
+        // Drop calls indexes before bulk RELATE.
+        let t_idx_drop = Instant::now();
+        db.query(
+            "REMOVE INDEX IF EXISTS idx_calls_in_file  ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_out_file ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_in_name  ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_out_name ON calls;"
+        ).await.context("phase2(ram): drop calls indexes")?;
+        info!(repo = %self.repo, idx_drop_ms = t_idx_drop.elapsed().as_millis() as u64, "phase2(ram): dropped calls indexes");
+
+        // Resolve all RAM-buffered raw_edges in one pass (no DB scan needed).
+        let t_resolve = Instant::now();
+        let mut edge_batch: Vec<(String, String, i64, String, String, String, String)> = Vec::new();
+        let mut relate_write_ms: u64 = 0;
+
+        for re in &raw_edges {
+            // Resolve this edge using the symbol map.
+            let candidates = match name_bucket.get(&re.to_name) {
+                Some(v) if !v.is_empty() => v,
+                _ => continue,
+            };
+            let best = Self::select_best_candidate(candidates, &re.from_file, re.import_path.as_deref());
+            let best = match best {
+                Some(b) => b,
+                None => continue,
+            };
+            let in_name = re.from_fqn.rsplit("::").next().unwrap_or("").to_string();
+            let out_name = best.name.clone();
+            edge_batch.push((
+                re.from_fqn.clone(),
+                best.fqn.clone(),
+                re.line,
+                re.from_file.clone(),
+                best.file.clone(),
+                in_name,
+                out_name,
+            ));
+
+            if edge_batch.len() >= EDGE_RELATE_BATCH_SIZE {
+                let t_write = Instant::now();
+                flush_edge_batch(db, &edge_batch)
+                    .await
+                    .context("phase2(ram): flush edge batch")?;
+                relate_write_ms += t_write.elapsed().as_millis() as u64;
+                edge_batch.clear();
+            }
+        }
+        let resolve_ms = t_resolve.elapsed().as_millis() as u64;
+        info!(repo = %self.repo, resolve_ms, "phase2(ram): in-memory resolution complete");
+
+        // Flush tail.
+        if !edge_batch.is_empty() {
+            let t_write = Instant::now();
+            flush_edge_batch(db, &edge_batch)
+                .await
+                .context("phase2(ram): flush tail edge batch")?;
+            relate_write_ms += t_write.elapsed().as_millis() as u64;
+        }
+
+        // Rebuild calls indexes synchronously (same as DB-scan Phase 2).
+        let t_idx_rebuild = Instant::now();
+        db.query(
+            "DEFINE INDEX IF NOT EXISTS idx_calls_in_file  ON calls FIELDS in_file; \
+             DEFINE INDEX IF NOT EXISTS idx_calls_out_file ON calls FIELDS out_file; \
+             DEFINE INDEX IF NOT EXISTS idx_calls_in_name  ON calls FIELDS in_name; \
+             DEFINE INDEX IF NOT EXISTS idx_calls_out_name ON calls FIELDS out_name;"
+        ).await.context("phase2(ram): rebuild calls indexes")?;
+        let idx_rebuild_ms = t_idx_rebuild.elapsed().as_millis() as u64;
+        info!(repo = %self.repo, idx_rebuild_ms, relate_write_ms, "phase2(ram): rebuilt calls indexes synchronously");
+
+        // Stamp edges_resolved marker.
+        set_meta(db, EDGES_RESOLVED_KEY, "1")
+            .await
+            .context("phase2(ram): set edges_resolved marker")?;
+
+        info!(repo = %self.repo, "phase2(ram): edge resolution complete");
         Ok(())
     }
 
@@ -1907,53 +2182,77 @@ async fn flush_chunk_batch(db: &Surreal<Db>, batch: Vec<ChunkRecord>) -> Result<
     Ok(())
 }
 
-/// Flush symbols for one file by batching multiple UPSERT statements into a
-/// single `db.query(...)` call per chunk of `WRITE_BATCH_SIZE`.
+/// Flush symbols using native `INSERT INTO symbol $data` with a `surrealdb::sql::Array`.
 ///
-/// SurrealDB record IDs (`symbol:\`⟨fqn⟩\``) must appear literally in SurrealQL
-/// and cannot be passed as typed parameters in UPSERT — the same constraint that
-/// requires `flush_edge_batch` to use text-query building. `escape_surreal` is
-/// the injection guard for all string field values and the FQN itself.
+/// Each symbol record is a `sql::Object` with an explicit string `id` field, bypassing the
+/// serde serialization path entirely — so INSERT uses it as the record key.
+///
+/// Why this is faster than text-built UPSERT batches:
+///   The text UPSERT approach builds 512 `UPSERT symbol:⟨fqn⟩ SET ...` statements per
+///   batch and sends them as a single multi-statement query.  SurrealDB must parse all
+///   512 statements.  The native sql::Array approach sends one INSERT statement with a
+///   bound `$data` array — just one statement to parse, no per-row SQL text construction.
+///
+/// Duplicate-FQN handling (`ON DUPLICATE KEY UPDATE`):
+///   A plain `INSERT` ERRORS when a record id already exists and rolls back the entire
+///   batch. C++ produces duplicate FQNs (a symbol declared in a .h and defined in a .cpp),
+///   so without the merge clause every batch containing a dup fails and 0 symbols persist.
+///   `ON DUPLICATE KEY UPDATE ... = $input.<field>` makes the duplicate update the existing
+///   record (last-write-wins), exactly matching the original UPSERT semantics.
 async fn flush_symbol_batch_native(db: &Surreal<Db>, symbols: &[Symbol]) -> Result<()> {
     use crate::store::ops::kind_to_str;
+    use std::collections::BTreeMap;
 
-    for chunk in symbols.chunks(WRITE_BATCH_SIZE) {
+    // Use a larger batch size for native INSERT (no per-statement parsing overhead).
+    // 4096 symbols × ~200 bytes = ~820KB per batch — safe payload size.
+    for chunk in symbols.chunks(4096) {
         if chunk.is_empty() {
             continue;
         }
 
-        // Build one multi-statement query for the whole chunk, mirroring
-        // flush_edge_batch's pattern for O(1) round-trips per batch.
-        let mut query = String::with_capacity(chunk.len() * 256);
-        for sym in chunk {
-            let fqn_esc = escape_surreal(&sym.qualified.fqn());
-            let name_esc = escape_surreal(&sym.qualified.name);
-            let kind_str = kind_to_str(&sym.kind);
-            let file_esc = escape_surreal(&sym.qualified.file);
-            let line_start = sym.line_start as i64;
-            let line_end = sym.line_end as i64;
+        let records: Vec<SqlValue> = chunk
+            .iter()
+            .map(|sym| {
+                let mut map: BTreeMap<String, SqlValue> = BTreeMap::new();
+                map.insert("id".to_string(), SqlValue::from(sym.qualified.fqn()));
+                map.insert("name".to_string(), SqlValue::from(sym.qualified.name.as_str()));
+                map.insert("kind".to_string(), SqlValue::from(kind_to_str(&sym.kind)));
+                map.insert("file".to_string(), SqlValue::from(sym.qualified.file.as_str()));
+                map.insert("line_start".to_string(), SqlValue::from(sym.line_start as i64));
+                map.insert("line_end".to_string(), SqlValue::from(sym.line_end as i64));
+                match &sym.signature {
+                    Some(s) => map.insert("signature".to_string(), SqlValue::from(s.as_str())),
+                    None    => map.insert("signature".to_string(), SqlValue::None),
+                };
+                match &sym.parent_fqn {
+                    Some(p) => map.insert("parent".to_string(), SqlValue::from(
+                        format!("symbol:⟨{}⟩", p)
+                    )),
+                    None => map.insert("parent".to_string(), SqlValue::None),
+                };
+                SqlValue::Object(SqlObject::from(map))
+            })
+            .collect();
 
-            // Optional fields: use SurrealQL NONE literal when absent.
-            let sig_val = match &sym.signature {
-                Some(s) => format!("'{}'", escape_surreal(s)),
-                None => "NONE".to_string(),
-            };
-            let parent_val = match &sym.parent_fqn {
-                Some(p) => format!("'symbol:⟨{}⟩'", escape_surreal(p)),
-                None => "NONE".to_string(),
-            };
+        let data = SqlArray::from(records);
 
-            query.push_str(&format!(
-                "UPSERT symbol:`⟨{fqn_esc}⟩` SET \
-                 name = '{name_esc}', kind = '{kind_str}', file = '{file_esc}', \
-                 line_start = {line_start}, line_end = {line_end}, \
-                 signature = {sig_val}, parent = {parent_val};\n"
-            ));
-        }
-
-        db.query(query)
+        // ON DUPLICATE KEY UPDATE: C++ declares a symbol in a .h and defines it
+        // in a .cpp, producing two records with the same FQN (= record id). A plain
+        // INSERT errors with "record already exists" and rolls back the WHOLE batch,
+        // silently leaving 0 symbols. The merge clause makes the duplicate update the
+        // existing record (last-write-wins), matching the original UPSERT semantics.
+        // `.check()` surfaces statement-level errors that `.await?` alone swallows.
+        db.query(
+            "INSERT INTO symbol $data ON DUPLICATE KEY UPDATE \
+             name = $input.name, kind = $input.kind, file = $input.file, \
+             line_start = $input.line_start, line_end = $input.line_end, \
+             signature = $input.signature, parent = $input.parent RETURN NONE",
+        )
+            .bind(("data", data))
             .await
-            .context("flush_symbol_batch_native: batched UPSERT")?;
+            .context("flush_symbol_batch_native: INSERT INTO symbol")?
+            .check()
+            .context("flush_symbol_batch_native: INSERT statement error")?;
     }
     Ok(())
 }
@@ -1973,16 +2272,20 @@ async fn flush_raw_edge_batch_native(db: &Surreal<Db>, edges: &[RawEdgeRecord]) 
     Ok(())
 }
 
-/// Flush a batch of resolved calls edges as a single multi-statement query.
+/// Flush a batch of resolved call edges using native `INSERT RELATION INTO calls $data`.
 ///
-/// Each edge is written as `RELATE symbol:⟨…⟩->calls->symbol:⟨…⟩ SET …`.
-/// All statements are concatenated into one `db.query(...)` call to achieve
-/// O(1) round-trips per batch instead of O(edges).
+/// This constructs a `surrealdb::sql::Array` directly — bypassing serde serialization
+/// entirely — so `in`/`out` fields are `Value::Thing` at the point they reach SurrealDB.
 ///
-/// Why text-query with escape_surreal instead of native bind:
-/// SurrealDB record IDs (`symbol:⟨fqn⟩`) cannot be passed as typed parameters
-/// in RELATE — they must appear literally in the SurrealQL text. escape_surreal
-/// handles the only injection surface (backslash and single-quote escaping).
+/// Why this works:
+///   `to_value<T>` has a fast-path (`castaway::match_type!`) for `sql::Array` at the top
+///   level: it returns `Value::Array(array)` without re-serializing the elements.  The
+///   `Value::Thing` entries inside each `Object` are already native SQL values — they are
+///   preserved exactly as `Thing { tb: "symbol", id: Id::String(fqn) }`.
+///
+///   The prior approach (`RELATE symbol:⟨fqn⟩->calls->symbol:⟨fqn⟩ SET ...`) built a
+///   multi-statement text query that SurrealDB had to parse for each row.  At 138K edges
+///   this parsing overhead dominated (~14s vs ~7s minimum for the raw KV writes).
 async fn flush_edge_batch(
     db: &Surreal<Db>,
     batch: &[(String, String, i64, String, String, String, String)],
@@ -1991,24 +2294,44 @@ async fn flush_edge_batch(
         return Ok(());
     }
 
-    let mut query = String::with_capacity(batch.len() * 256);
-    for (from_fqn, to_fqn, line, in_file, out_file, in_name, out_name) in batch {
-        let from_esc  = escape_surreal(from_fqn);
-        let to_esc    = escape_surreal(to_fqn);
-        let in_file_e = escape_surreal(in_file);
-        let out_file_e = escape_surreal(out_file);
-        let in_name_e  = escape_surreal(in_name);
-        let out_name_e = escape_surreal(out_name);
-        query.push_str(&format!(
-            "RELATE symbol:`⟨{from_esc}⟩`->calls->symbol:`⟨{to_esc}⟩` \
-             SET line = {line}, in_file = '{in_file_e}', out_file = '{out_file_e}', \
-             in_name = '{in_name_e}', out_name = '{out_name_e}';\n"
-        ));
-    }
+    // Build a sql::Array of sql::Object records.  Each Object has:
+    //   in:       Value::Thing(symbol:⟨from_fqn⟩)
+    //   out:      Value::Thing(symbol:⟨to_fqn⟩)
+    //   line:     Value::Number(i64)
+    //   in_file:  Value::Strand(string)
+    //   out_file: Value::Strand(string)
+    //   in_name:  Value::Strand(string)
+    //   out_name: Value::Strand(string)
+    //
+    // The Array is passed as `$data`.  `to_value(sql::Array)` fast-paths through
+    // `sql::Array as v => Ok(v.into())` — no serde, no type loss.
+    use std::collections::BTreeMap;
 
-    db.query(query)
+    let records: Vec<SqlValue> = batch
+        .iter()
+        .map(|(from_fqn, to_fqn, line, in_file, out_file, in_name, out_name)| {
+            let mut map: BTreeMap<String, SqlValue> = BTreeMap::new();
+            map.insert("in".to_string(), SqlValue::Thing(
+                SqlThing::from(("symbol", SqlId::String(from_fqn.clone())))
+            ));
+            map.insert("out".to_string(), SqlValue::Thing(
+                SqlThing::from(("symbol", SqlId::String(to_fqn.clone())))
+            ));
+            map.insert("line".to_string(), SqlValue::from(*line));
+            map.insert("in_file".to_string(), SqlValue::from(in_file.as_str()));
+            map.insert("out_file".to_string(), SqlValue::from(out_file.as_str()));
+            map.insert("in_name".to_string(), SqlValue::from(in_name.as_str()));
+            map.insert("out_name".to_string(), SqlValue::from(out_name.as_str()));
+            SqlValue::Object(SqlObject::from(map))
+        })
+        .collect();
+
+    let data = SqlArray::from(records);
+
+    db.query("INSERT RELATION INTO calls $data")
+        .bind(("data", data))
         .await
-        .context("flush_edge_batch: RELATE statements")?;
+        .context("flush_edge_batch: INSERT RELATION")?;
 
     Ok(())
 }

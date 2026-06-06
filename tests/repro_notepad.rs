@@ -3,6 +3,154 @@ use context_engine_rs::store::open_db;
 use std::time::Instant;
 use tempfile::TempDir;
 
+/// Upgrade-path regression guard: applying SCHEMA_DDL over the OLDEST stale symbol
+/// schema (parent = option<record<symbol>>) must flip it to SCHEMALESS so the native
+/// symbol INSERT (which writes parent as a plain string) persists instead of silently
+/// rolling back the whole batch.
+///
+/// Before the fix this left 0 symbols on upgrade. SCHEMA_DDL now runs
+/// `DEFINE TABLE OVERWRITE symbol SCHEMALESS` + `REMOVE FIELD IF EXISTS …`
+/// synchronously on every open_db, so the flip happens before any write — no race.
+#[tokio::test]
+async fn schema_ddl_flips_stale_symbol_so_native_insert_persists() {
+    use context_engine_rs::store::schema::SCHEMA_DDL;
+    use surrealdb::engine::local::SurrealKv;
+    use surrealdb::sql::{Array as SqlArray, Object as SqlObject, Value as SqlValue};
+    use std::collections::BTreeMap;
+
+    let dir = TempDir::new().unwrap();
+    let db = surrealdb::Surreal::new::<SurrealKv>(dir.path().to_str().unwrap()).await.unwrap();
+    db.use_ns("t").use_db("t").await.unwrap();
+
+    // Oldest stale prod schema: parent declared as a record link + a sentinel row,
+    // proving the flip preserves existing data.
+    db.query(
+        "DEFINE TABLE symbol SCHEMAFULL;\
+         DEFINE FIELD name   ON symbol TYPE string;\
+         DEFINE FIELD parent ON symbol TYPE option<record<symbol>>;"
+    ).await.unwrap().check().unwrap();
+    db.query("CREATE symbol:keep SET name = 'sentinel', parent = NONE")
+        .await.unwrap().check().unwrap();
+
+    // Apply the real production DDL (idempotent flip happens here).
+    db.query(SCHEMA_DDL).await.unwrap().check()
+        .expect("SCHEMA_DDL must apply cleanly over a stale SCHEMAFULL symbol table");
+    // Re-apply to prove idempotency (open_db runs it on every open).
+    db.query(SCHEMA_DDL).await.unwrap().check()
+        .expect("SCHEMA_DDL must be idempotent");
+
+    // Native insert writing parent as a plain string — the exact pipeline path.
+    let mut m: BTreeMap<String, SqlValue> = BTreeMap::new();
+    m.insert("id".into(), SqlValue::from("a.cpp::foo"));
+    m.insert("name".into(), SqlValue::from("foo"));
+    m.insert("parent".into(), SqlValue::from("symbol:⟨a.cpp::Bar⟩"));
+    let data = SqlArray::from(vec![SqlValue::Object(SqlObject::from(m))]);
+    db.query("INSERT INTO symbol $data ON DUPLICATE KEY UPDATE name = $input.name RETURN NONE")
+        .bind(("data", data))
+        .await.unwrap().check()
+        .expect("native symbol INSERT must not be rejected by a stale parent field type");
+
+    #[derive(serde::Deserialize)]
+    struct C { count: i64 }
+    let rows: Vec<C> = db.query("SELECT count() AS count FROM symbol GROUP ALL")
+        .await.unwrap().take(0).unwrap();
+    assert_eq!(
+        rows.first().map(|r| r.count).unwrap_or(0), 2,
+        "sentinel row must survive the flip AND the new symbol must persist"
+    );
+}
+
+
+/// Regression guard for the silent-empty-symbol bug.
+///
+/// `INSERT INTO symbol $data` errors with "record already exists" on a batch that
+/// contains a duplicate record id (C++ declares a symbol in a .h and defines it in a
+/// .cpp → same FQN). The error rolls back the WHOLE batch and is swallowed by
+/// `.await` (it only surfaces via `.check()` or `.take()`), so the symbol table ends
+/// up empty and Phase 2 resolves zero call edges — fast but broken.
+///
+/// The fix is `ON DUPLICATE KEY UPDATE ... = $input.<field>` (last-write-wins merge).
+/// This test asserts that the merge clause persists all distinct ids and surfaces no
+/// error, exactly as the symbol flush path relies on.
+#[tokio::test]
+async fn insert_with_duplicate_id_merges_instead_of_failing() {
+    use surrealdb::engine::local::SurrealKv;
+    use surrealdb::sql::{Array as SqlArray, Object as SqlObject, Value as SqlValue};
+    use std::collections::BTreeMap;
+
+    let dir = TempDir::new().unwrap();
+    let db = surrealdb::Surreal::new::<SurrealKv>(dir.path().to_str().unwrap()).await.unwrap();
+    db.use_ns("t").use_db("t").await.unwrap();
+    db.query("DEFINE TABLE symbol SCHEMALESS").await.unwrap();
+
+    fn rec(id: &str, name: &str) -> SqlValue {
+        let mut m: BTreeMap<String, SqlValue> = BTreeMap::new();
+        m.insert("id".into(), SqlValue::from(id));
+        m.insert("name".into(), SqlValue::from(name));
+        SqlValue::Object(SqlObject::from(m))
+    }
+
+    // Batch contains a duplicate id ("A" twice) — mimics C++ .h/.cpp dup FQNs.
+    let data = SqlArray::from(vec![rec("A", "first"), rec("B", "b"), rec("A", "second")]);
+    db.query("INSERT INTO symbol $data ON DUPLICATE KEY UPDATE name = $input.name RETURN NONE")
+        .bind(("data", data))
+        .await
+        .expect("insert await")
+        .check()
+        .expect("INSERT with ON DUPLICATE KEY UPDATE must not error on duplicate id");
+
+    #[derive(serde::Deserialize)]
+    struct C { count: i64 }
+    let rows: Vec<C> = db
+        .query("SELECT count() AS count FROM symbol GROUP ALL")
+        .await.unwrap().take(0).unwrap();
+    assert_eq!(
+        rows.first().map(|r| r.count).unwrap_or(0), 2,
+        "both distinct ids (A, B) must persist — duplicate A merges, not rolls back the batch"
+    );
+
+    #[derive(serde::Deserialize)]
+    struct N { name: String }
+    let a: Vec<N> = db
+        .query("SELECT name FROM symbol:A")
+        .await.unwrap().take(0).unwrap();
+    assert_eq!(
+        a.first().map(|r| r.name.as_str()), Some("second"),
+        "duplicate id must update to the last-written value (matches original UPSERT)"
+    );
+}
+
+/// Accuracy guard for the real ~/.vibervn DB after a notepad-ade rebuild.
+/// Asserts symbols + the calls graph actually persisted (this is exactly the state
+/// the silent-empty-symbol bug left at 0). Run after a warm-cache rebuild:
+///   cargo test --release --test repro_notepad count_real_db_rows -- --ignored --nocapture
+#[ignore]
+#[tokio::test]
+async fn count_real_db_rows() {
+    let repo = "D:/projects/Cpp/notepad-ade".to_string();
+    let home_dir = dirs::home_dir().expect("home dir");
+    let db = open_db(&home_dir, &repo).await.expect("open real db");
+
+    #[derive(serde::Deserialize)]
+    struct C { count: i64 }
+    async fn count(db: &surrealdb::Surreal<surrealdb::engine::local::Db>, table: &str) -> i64 {
+        let q = format!("SELECT count() AS count FROM {table} GROUP ALL");
+        let rows: Vec<C> = db.query(q).await.unwrap().take(0).unwrap();
+        rows.first().map(|r| r.count).unwrap_or(0)
+    }
+
+    let symbols = count(&db, "symbol").await;
+    let chunks = count(&db, "chunk").await;
+    let calls = count(&db, "calls").await;
+    let raw_edges = count(&db, "raw_edge").await;
+    eprintln!(
+        "REAL DB ROWS: symbol={symbols} chunk={chunks} calls={calls} raw_edge={raw_edges}"
+    );
+    assert!(symbols > 0, "symbol table must not be empty (silent-empty-symbol regression)");
+    assert!(chunks > 0, "chunk table must not be empty");
+    assert!(calls > 0, "calls graph must not be empty — graph-expansion retrieval depends on it");
+}
+
 #[tokio::test]
 async fn repro_full_rebuild_notepad_ade_fresh_db() {
     // Surface info-level logs (incl. the `PERF SUMMARY` line) on stderr.
@@ -30,12 +178,30 @@ async fn repro_full_rebuild_notepad_ade_fresh_db() {
     let wall = start.elapsed();
 
     match res {
-        Ok(s) => eprintln!(
-            "REPRO OK: indexed={} total={} wall={:.1}s",
-            s.indexed_files,
-            s.total_files,
-            wall.as_secs_f64()
-        ),
+        Ok(s) => {
+            #[derive(serde::Deserialize)]
+            struct C { count: i64 }
+            async fn count(db: &surrealdb::Surreal<surrealdb::engine::local::Db>, table: &str) -> i64 {
+                let q = format!("SELECT count() AS count FROM {table} GROUP ALL");
+                let rows: Vec<C> = db.query(q).await.unwrap().take(0).unwrap();
+                rows.first().map(|r| r.count).unwrap_or(0)
+            }
+            let symbols = count(&db, "symbol").await;
+            let chunks = count(&db, "chunk").await;
+            let calls = count(&db, "calls").await;
+            eprintln!(
+                "REPRO OK: indexed={} total={} wall={:.1}s | PERSISTED symbol={} chunk={} calls={}",
+                s.indexed_files,
+                s.total_files,
+                wall.as_secs_f64(),
+                symbols, chunks, calls,
+            );
+            // Accuracy guards: the silent-empty-symbol bug left symbol=0 and calls=0
+            // while chunk stayed populated. Assert the call graph is actually built.
+            assert!(symbols > 0, "symbol table must not be empty (silent-empty-symbol regression)");
+            assert!(chunks > 0, "chunk table must not be empty");
+            assert!(calls > 0, "calls graph must not be empty — graph-expansion retrieval depends on it");
+        }
         Err(e) => panic!("REPRO FAILED at: {e:#}"),
     }
 }
@@ -264,12 +430,19 @@ async fn repro_full_rebuild_notepad_ade_warm_cache() {
         Ok(s) => {
             eprintln!(
                 "REPRO WARM-CACHE OK: indexed={} wall={:.1}s \
-                 cache_hit_chunks={} cache_miss_chunks={} embed_total_ms={}",
+                 cache_hit_chunks={} cache_miss_chunks={} embed_total_ms={} \
+                 stage3_chunk_ms={} chunk_db_ms={} chunk_cpu_ms={} \
+                 chunk_idx_drop_ms={} chunk_idx_rebuild_ms={}",
                 s.indexed_files,
                 wall.as_secs_f64(),
                 s.cache_hit_chunks,
                 s.cache_miss_chunks,
                 s.embed_total_ms,
+                s.stage3_chunk_ms,
+                s.stage3_chunk_db_ms,
+                s.stage3_chunk_cpu_ms,
+                s.stage3_chunk_idx_drop_ms,
+                s.stage3_chunk_idx_rebuild_ms,
             );
         }
         Err(e) => panic!("REPRO WARM-CACHE FAILED: {e:#}"),

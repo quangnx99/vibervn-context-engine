@@ -17,7 +17,11 @@ use crate::store::schema::SCHEMA_DDL;
 /// v1 = original schema (no in_name/out_name, no chunk_count).
 /// v2 = adds calls.in_name/out_name + file_meta.chunk_count.
 /// v3 = chunk table flipped to SCHEMALESS for ~8.9× faster writes.
-pub const DB_SCHEMA_VERSION: u32 = 3;
+/// v4 = symbol table flipped to SCHEMALESS so the native sql::Array INSERT path
+///      (which writes parent as a plain string) is not rejected by an existing
+///      SCHEMAFULL symbol.parent definition (older DBs declared it as
+///      option<record<symbol>>, which silently rolled back the whole batch → 0 symbols).
+pub const DB_SCHEMA_VERSION: u32 = 4;
 
 /// key in index_meta for the DB schema version.
 pub const DB_SCHEMA_VERSION_KEY: &str = "db_schema_version";
@@ -97,30 +101,28 @@ pub fn maybe_spawn_migration(db: Surreal<Db>, stored_version: u32) {
     if stored_version >= DB_SCHEMA_VERSION {
         return;
     }
-    if stored_version < 2 {
-        info!(stored_version, target = 2, "spawning v1→v2 DB migration background task");
-        let db_clone = db.clone();
-        let needs_v3 = stored_version < 3;
-        tokio::spawn(async move {
-            if let Err(e) = run_migration_v1_to_v2(&db_clone).await {
-                warn!(error = %e, "v1→v2 DB migration failed");
-                return; // don't proceed to v3 if v2 failed
+    info!(stored_version, target = DB_SCHEMA_VERSION, "spawning chained DB migration background task");
+    // Run all needed migrations in one chained task so each completes before the
+    // next starts. A failed step aborts the chain via `?` (the version stamp is only
+    // written on success, so the next open retries from the same point).
+    tokio::spawn(async move {
+        let result: Result<()> = async {
+            if stored_version < 2 {
+                run_migration_v1_to_v2(&db).await.context("v1→v2")?;
             }
-            if needs_v3 {
-                info!(stored_version, target = 3, "spawning v2→v3 DB migration (chained after v1→v2)");
-                if let Err(e) = run_migration_v2_to_v3(&db_clone).await {
-                    warn!(error = %e, "v2→v3 DB migration failed");
-                }
+            if stored_version < 3 {
+                run_migration_v2_to_v3(&db).await.context("v2→v3")?;
             }
-        });
-    } else if stored_version < 3 {
-        info!(stored_version, target = 3, "spawning v2→v3 DB migration background task");
-        tokio::spawn(async move {
-            if let Err(e) = run_migration_v2_to_v3(&db).await {
-                warn!(error = %e, "v2→v3 DB migration failed");
+            if stored_version < 4 {
+                run_migration_v3_to_v4(&db).await.context("v3→v4")?;
             }
-        });
-    }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            warn!(error = %e, "chained DB migration failed");
+        }
+    });
 }
 
 /// Paged v1→v2 migration. Must be idempotent (safe to re-run).
@@ -386,6 +388,49 @@ pub async fn run_migration_v2_to_v3(db: &Surreal<Db>) -> Result<()> {
         .context("migration v2→v3: stamp db_schema_version=3")?;
 
     info!("migration v2→v3 complete");
+    Ok(())
+}
+
+/// Migrate the symbol table from SCHEMAFULL to SCHEMALESS.
+///
+/// Why: the native `INSERT INTO symbol $data` path (flush_symbol_batch_native) writes
+/// `parent` as a plain string "symbol:⟨fqn⟩". Older DBs declared `parent` as
+/// `option<record<symbol>>`; SCHEMAFULL type enforcement rejects the string and rolls
+/// back the WHOLE INSERT batch, so 0 symbols persist and Phase 2 resolves 0 call edges —
+/// a silent accuracy regression with no surfaced error. Flipping to SCHEMALESS removes
+/// the enforcement; correctness is guaranteed by the explicit per-field Value types in
+/// flush_symbol_batch_native.
+///
+/// `DEFINE TABLE OVERWRITE ... SCHEMALESS` alone is NOT sufficient — the persisted
+/// `DEFINE FIELD` definitions still enforce their types. Each field definition must be
+/// explicitly removed (verified: flip-only leaves the insert failing; flip + REMOVE FIELD
+/// makes it succeed). Mirrors run_migration_v2_to_v3 for the chunk table.
+///
+/// Idempotent: DEFINE TABLE OVERWRITE on an already-SCHEMALESS table and REMOVE FIELD on
+/// an absent field are both no-ops. The existing symbol rows and their data are preserved.
+pub async fn run_migration_v3_to_v4(db: &Surreal<Db>) -> Result<()> {
+    info!("migration v3→v4: flipping symbol table to SCHEMALESS");
+
+    db.query(
+        "DEFINE TABLE OVERWRITE symbol SCHEMALESS;\
+         REMOVE FIELD IF EXISTS name ON symbol;\
+         REMOVE FIELD IF EXISTS kind ON symbol;\
+         REMOVE FIELD IF EXISTS file ON symbol;\
+         REMOVE FIELD IF EXISTS line_start ON symbol;\
+         REMOVE FIELD IF EXISTS line_end ON symbol;\
+         REMOVE FIELD IF EXISTS signature ON symbol;\
+         REMOVE FIELD IF EXISTS parent ON symbol;",
+    )
+    .await
+    .context("migration v3→v4: flip symbol to SCHEMALESS + remove fields")?
+    .check()
+    .context("migration v3→v4: symbol flip statement error")?;
+
+    ops::set_meta(db, DB_SCHEMA_VERSION_KEY, "4")
+        .await
+        .context("migration v3→v4: stamp db_schema_version=4")?;
+
+    info!("migration v3→v4 complete");
     Ok(())
 }
 

@@ -15,14 +15,27 @@
 /// never triggers a rebuild of an existing index unnecessarily; a new index name will
 /// still be created.
 pub const SCHEMA_DDL: &str = r#"
-DEFINE TABLE IF NOT EXISTS symbol SCHEMAFULL;
-DEFINE FIELD OVERWRITE name       ON symbol TYPE string;
-DEFINE FIELD OVERWRITE kind       ON symbol TYPE string;
-DEFINE FIELD OVERWRITE file       ON symbol TYPE string;
-DEFINE FIELD OVERWRITE line_start ON symbol TYPE int;
-DEFINE FIELD OVERWRITE line_end   ON symbol TYPE int;
-DEFINE FIELD OVERWRITE signature  ON symbol TYPE option<string>;
-DEFINE FIELD OVERWRITE parent     ON symbol TYPE option<string>;
+-- SCHEMALESS: a SCHEMAFULL symbol table enforces per-field types. The native
+-- sql::Array INSERT path writes `parent` as a plain string ("symbol:⟨fqn⟩"), which
+-- an older SCHEMAFULL definition of `parent` as option<record<symbol>> rejects —
+-- silently rolling back the ENTIRE batch (0 symbols persisted, no surfaced error).
+-- SCHEMALESS removes that enforcement; field type safety is guaranteed at write time
+-- by flush_symbol_batch_native (explicit Value types per field). Per-field validation
+-- also cost ~4s for 27K rows during full rebuild.
+--
+-- OVERWRITE (not IF NOT EXISTS) + REMOVE FIELD runs on EVERY open_db, so an existing
+-- SCHEMAFULL symbol table from a pre-v4 DB is flipped to SCHEMALESS synchronously
+-- BEFORE the indexer writes — avoiding the race where the background v3→v4 migration
+-- has not yet completed. Verified: OVERWRITE on a populated table preserves all rows
+-- and is idempotent; REMOVE FIELD IF EXISTS is a no-op once the fields are gone.
+DEFINE TABLE OVERWRITE symbol SCHEMALESS;
+REMOVE FIELD IF EXISTS name       ON symbol;
+REMOVE FIELD IF EXISTS kind       ON symbol;
+REMOVE FIELD IF EXISTS file       ON symbol;
+REMOVE FIELD IF EXISTS line_start ON symbol;
+REMOVE FIELD IF EXISTS line_end   ON symbol;
+REMOVE FIELD IF EXISTS signature  ON symbol;
+REMOVE FIELD IF EXISTS parent     ON symbol;
 DEFINE INDEX IF NOT EXISTS idx_symbol_file ON symbol FIELDS file;
 DEFINE INDEX IF NOT EXISTS idx_symbol_name ON symbol FIELDS name;
 
