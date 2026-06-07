@@ -2005,7 +2005,11 @@ function renderSearchResults(results, containerId, emptyId) {
     if (currentSearchRepo && displayPath.startsWith(currentSearchRepo)) {
       displayPath = displayPath.slice(currentSearchRepo.length).replace(/^[\/\\]/, '');
     }
-    loc.textContent = displayPath + '#L' + r.line_start + '-' + r.line_end;
+    let locText = displayPath + '#L' + r.line_start + '-' + r.line_end;
+    if (r.callers != null) {
+      locText += ' (' + r.callers + '/' + (r.caller_files || 0) + 'f)';
+    }
+    loc.textContent = locText;
 
     const score = document.createElement('span');
     score.className = 'text-xs px-2 py-0.5 rounded-full bg-blue-100 dark:bg-wiki-border text-blue-700 dark:text-wiki-link whitespace-nowrap';
