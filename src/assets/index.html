@@ -185,6 +185,11 @@
 
     <!-- Tab: Settings (Embedding + LLM) -->
     <div role="tabpanel" id="panel-settings" class="hidden">
+      <!-- Setup hint (shown when no embedding keys configured) -->
+      <div id="banner-setup" class="hidden mb-6 p-4 border border-blue-400/40 dark:border-wiki-border-active/50 bg-blue-50 dark:bg-wiki-border-active/10 rounded text-sm text-blue-800 dark:text-wiki-link">
+        Add an embedding API key below to start indexing repositories.
+      </div>
+
       <!-- Section: Embedding Provider -->
       <section class="mb-8">
         <h2 class="font-wiki text-xl dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-4">
@@ -1024,6 +1029,7 @@ function renderAll() {
     renderAll();
     saveNow();
   });
+  document.getElementById('banner-setup').classList.toggle('hidden', !needsSetup());
 }
 
 function escHtml(str) {
@@ -1058,6 +1064,21 @@ function saveDebounced() {
   saveTimer = setTimeout(saveNow, 400);
 }
 
+// ─── First-use detection ──────────────────────────────────────────────────
+function needsSetup() {
+  if (!cfg) return false;
+  return !cfg.embedding.api_keys || cfg.embedding.api_keys.length === 0;
+}
+
+function navigateIfFirstUse() {
+  if (!needsSetup()) {
+    document.getElementById('banner-setup').classList.add('hidden');
+    return;
+  }
+  activateTab(2);
+  document.getElementById('banner-setup').classList.remove('hidden');
+}
+
 // ─── Load ──────────────────────────────────────────────────────────────────
 async function loadConfig() {
   try {
@@ -1074,6 +1095,7 @@ async function loadConfig() {
     document.getElementById('skeleton').classList.add('hidden');
     document.getElementById('main-content').classList.remove('hidden');
     renderAll();
+    navigateIfFirstUse();
   } catch (err) {
     document.getElementById('skeleton').classList.add('hidden');
     document.getElementById('main-content').classList.remove('hidden');
