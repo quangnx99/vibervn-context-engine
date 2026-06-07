@@ -70,12 +70,12 @@ pub async fn rerank(
         Documentation can be outdated or inaccurate, but the code always reflects actual behavior. \
         Each code line is prefixed with its absolute line number (\"123: code\"). ";
 
-    let element_spec = "Each element MUST be an object identified by `i` (the chunk index), in ONE of two forms: \
+    let element_spec = "Each element MUST be an object identified by `chunk_index` (the chunk index), in ONE of two forms: \
         to narrow a large chunk to the relevant parts, use \
-        {\"i\": <index>, \"lines\": [[start, end], ...]} where `lines` are absolute line-number \
+        {\"chunk_index\": <index>, \"lines\": [[start, end], ...]} where `lines` are absolute line-number \
         ranges to keep from that chunk; \
         to keep an entire chunk (small chunks, or chunks that are wholly relevant), use \
-        {\"i\": <index>, \"keep\": \"full\"}. \
+        {\"chunk_index\": <index>, \"keep\": \"full\"}. \
         Only include chunks that are actually relevant to the query.";
 
     let system = if structured {
@@ -131,7 +131,7 @@ pub async fn rerank(
             "Query: {query}\n\nChunks:\n{chunks_text}\n\n\
              Now rank the chunks by relevance. Respond with a JSON object \
              {{\"ranked_indices\": [ ... ]}} whose array holds objects — \
-             {{\"i\":index,\"lines\":[[start,end]]}} to narrow, or {{\"i\":index,\"keep\":\"full\"}} \
+             {{\"chunk_index\":index,\"lines\":[[start,end]]}} to narrow, or {{\"chunk_index\":index,\"keep\":\"full\"}} \
              to keep the whole chunk — from most to least relevant."
         )
     } else {
@@ -139,7 +139,7 @@ pub async fn rerank(
             "Query: {query}\n\nChunks:\n{chunks_text}\n\n\
              Now rank the chunks by relevance. \
              Write the opening tag <ranked_indices>, then a JSON array of objects — \
-             {{\"i\":index,\"lines\":[[start,end]]}} to narrow, or {{\"i\":index,\"keep\":\"full\"}} \
+             {{\"chunk_index\":index,\"lines\":[[start,end]]}} to narrow, or {{\"chunk_index\":index,\"keep\":\"full\"}} \
              to keep the whole chunk — from most to least relevant, then the closing tag \
              </ranked_indices>."
         )
@@ -263,12 +263,13 @@ fn parse_rerank_response(
 
     for entry in &parsed {
         // Element is a bare integer index (back-compat safety net), or an object:
-        //   {"i": idx, "lines": [[s,e],...]}  → narrow to ranges
-        //   {"i": idx, "keep": "full"}        → whole chunk (no `lines` field)
+        //   {"chunk_index": idx, "lines": [[s,e],...]}  → narrow to ranges
+        //   {"chunk_index": idx, "keep": "full"}        → whole chunk (no `lines` field)
+        //   "i" accepted as legacy alias for "chunk_index"
         let (idx, raw_lines) = if let Some(i) = entry.as_u64() {
             (i as usize, None)
         } else if let Some(obj) = entry.as_object() {
-            let Some(i) = obj.get("i").and_then(|v| v.as_u64()) else { continue };
+            let Some(i) = obj.get("chunk_index").or_else(|| obj.get("i")).and_then(|v| v.as_u64()) else { continue };
             (i as usize, obj.get("lines").and_then(|v| v.as_array()))
         } else {
             continue;
@@ -469,7 +470,7 @@ mod tests {
         // Chunk 100..200 is large (>30 lines) so pruning applies.
         let chunks = vec![chunk(100, 200)];
         let out = parse(
-            "<ranked_indices>[{\"i\":0,\"lines\":[[110,120]]}]</ranked_indices>",
+            "<ranked_indices>[{\"chunk_index\":0,\"lines\":[[110,120]]}]</ranked_indices>",
             &chunks,
         );
         assert_eq!(out.reranked_indices, vec![0]);
@@ -478,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_object_without_i_is_skipped() {
+    fn parse_object_without_chunk_index_is_skipped() {
         let chunks = vec![chunk(1, 10)];
         let out = parse(
             "<ranked_indices>[{\"lines\":[[1,2]]}, 0]</ranked_indices>",
@@ -496,11 +497,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_keep_full_is_whole_chunk() {
-        // Canonical "keep whole chunk" form: {"i":idx,"keep":"full"} — no `lines` field.
+    fn parse_legacy_i_alias_still_accepted() {
         let chunks = vec![chunk(100, 200)];
         let out = parse(
-            "<ranked_indices>[{\"i\":0,\"keep\":\"full\"}]</ranked_indices>",
+            "<ranked_indices>[{\"i\":0,\"lines\":[[110,120]]}]</ranked_indices>",
+            &chunks,
+        );
+        assert_eq!(out.reranked_indices, vec![0]);
+        assert_eq!(out.line_selections, vec![Some(vec![(108, 122)])]);
+    }
+
+    #[test]
+    fn parse_keep_full_is_whole_chunk() {
+        // Canonical "keep whole chunk" form: {"chunk_index":idx,"keep":"full"} — no `lines` field.
+        let chunks = vec![chunk(100, 200)];
+        let out = parse(
+            "<ranked_indices>[{\"chunk_index\":0,\"keep\":\"full\"}]</ranked_indices>",
             &chunks,
         );
         assert_eq!(out.reranked_indices, vec![0]);
@@ -512,7 +524,7 @@ mod tests {
         // Safety net: a stray empty `lines` array still degrades to whole chunk.
         let chunks = vec![chunk(100, 200)];
         let out = parse(
-            "<ranked_indices>[{\"i\":0,\"lines\":[]}]</ranked_indices>",
+            "<ranked_indices>[{\"chunk_index\":0,\"lines\":[]}]</ranked_indices>",
             &chunks,
         );
         assert_eq!(out.reranked_indices, vec![0]);
@@ -524,7 +536,7 @@ mod tests {
         // Chunk span 9 < min_prune_lines (16) → selection forced to None.
         let chunks = vec![chunk(1, 10)];
         let out = parse(
-            "<ranked_indices>[{\"i\":0,\"lines\":[[3,5]]}]</ranked_indices>",
+            "<ranked_indices>[{\"chunk_index\":0,\"lines\":[[3,5]]}]</ranked_indices>",
             &chunks,
         );
         assert_eq!(out.line_selections, vec![None]);
@@ -546,7 +558,7 @@ mod tests {
         // {"ranked_indices":[...]} object root, reusing the same element forms.
         let chunks = vec![chunk(1, 10), chunk(100, 200)];
         let out = parse_structured(
-            "{\"ranked_indices\":[{\"i\":1,\"lines\":[[110,120]]},{\"i\":0,\"keep\":\"full\"}]}",
+            "{\"ranked_indices\":[{\"chunk_index\":1,\"lines\":[[110,120]]},{\"chunk_index\":0,\"keep\":\"full\"}]}",
             &chunks,
         );
         assert!(!out.fallback_used);
@@ -586,11 +598,11 @@ mod tests {
 
     #[test]
     fn parse_structured_unknown_entry_keys_skipped() {
-        // Element-level tolerance is preserved: an object without `i` is skipped,
+        // Element-level tolerance: an object without `chunk_index` or `i` is skipped,
         // the valid one is kept. (Same loop as XML mode.)
         let chunks = vec![chunk(1, 10), chunk(1, 10)];
         let out = parse_structured(
-            "{\"ranked_indices\":[{\"lines\":[[1,2]]},{\"i\":1,\"keep\":\"full\"}]}",
+            "{\"ranked_indices\":[{\"lines\":[[1,2]]},{\"chunk_index\":1,\"keep\":\"full\"}]}",
             &chunks,
         );
         assert!(!out.fallback_used);
