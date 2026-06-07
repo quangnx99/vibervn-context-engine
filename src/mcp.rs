@@ -390,6 +390,7 @@ async fn do_query(
         repo_dbs,
         settings.llm.rerank_min_prune_lines,
         llm_client.as_ref(),
+        Duration::from_secs(settings.mcp_index_wait_secs),
     )
     .await
     {

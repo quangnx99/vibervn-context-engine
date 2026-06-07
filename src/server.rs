@@ -621,17 +621,27 @@ async fn post_query(
     };
 
     let top_k = req.top_k.max(1);
-    let repo_filter = req.repo.as_deref();
+
+    // A repo is mandatory: queries are always scoped to one repository. Reject a
+    // repo-less query rather than silently searching across every configured repo.
+    let repo_filter = match req.repo.as_deref().map(str::trim) {
+        Some(r) if !r.is_empty() => r,
+        _ => {
+            let body = json!({ "error": "A repository is required. Pass `repo` with the workspace path to scope the query." });
+            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+        }
+    };
 
     match query::run_query(
         &req.query,
         top_k,
-        repo_filter,
+        Some(repo_filter),
         &voyage_client,
         &state.index_engine,
         &state.repo_dbs,
         settings.llm.rerank_min_prune_lines,
         llm_client.as_ref(),
+        std::time::Duration::from_secs(settings.mcp_index_wait_secs),
     )
     .await
     {

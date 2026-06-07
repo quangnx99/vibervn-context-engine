@@ -71,6 +71,7 @@ struct ChunkContentRow {
 ///
 /// `repo_filter`: if Some, only return results from that repo path prefix.
 /// `llm_client`: if None, rerank step is skipped.
+/// `warm_wait`: max time to block warming a cold single-repo shard before search.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query(
     query: &str,
@@ -81,6 +82,7 @@ pub async fn run_query(
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     min_prune_lines: u32,
     llm_client: Option<&LlmClient>,
+    warm_wait: std::time::Duration,
 ) -> Result<QueryResult> {
     let total_start = Instant::now();
 
@@ -96,7 +98,7 @@ pub async fn run_query(
     // ── Step 2: Vector search ─────────────────────────────────────────────
     let search_start = Instant::now();
     // Search for 2× top_k so graph expansion has candidates to work with.
-    let raw_results = index_engine.vector_search(&embedding, top_k * 2, repo_filter).await;
+    let raw_results = index_engine.vector_search(&embedding, top_k * 2, repo_filter, warm_wait).await;
     let search_ms = search_start.elapsed().as_millis() as u64;
 
     if raw_results.is_empty() {
