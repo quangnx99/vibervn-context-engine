@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,6 +28,12 @@ pub struct CodeResult {
     /// Numbered lines from filesystem, or stored content on fallback.
     pub content: String,
     pub symbol: Option<String>,
+    /// Number of direct callers (depth-1) from the call graph. Lower bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callers: Option<u32>,
+    /// Number of distinct files containing direct callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_files: Option<u32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -137,7 +143,7 @@ pub async fn run_query(
 
     let mut base_chunks: Vec<MergeChunk> = Vec::with_capacity(filtered.len());
     for sr in &filtered {
-        let (content, symbol) =
+        let (content, symbol, symbol_fqn) =
             fetch_chunk_content(&db_map, &sr.chunk_id.file, sr.chunk_id.line_start, sr.chunk_id.line_end).await;
         base_chunks.push(MergeChunk {
             file: sr.chunk_id.file.clone(),
@@ -146,6 +152,7 @@ pub async fn run_query(
             score: sr.score,
             content,
             symbol,
+            symbol_fqn,
         });
     }
 
@@ -176,6 +183,7 @@ pub async fn run_query(
             score: e.score,
             content: e.content,
             symbol: e.symbol,
+            symbol_fqn: e.symbol_fqn,
         });
     }
 
@@ -194,9 +202,12 @@ pub async fn run_query(
         .map(|c| read_lines_from_fs(&c.file, c.line_start, c.line_end).ok())
         .collect();
 
+    // ── Step 5.5: Caller stats (parallel with numbered read, bounded by top_k)
+    let caller_stats = fetch_caller_stats_batch(&merged, &db_map, schema_version).await;
+
     // ── Step 6: Rerank ────────────────────────────────────────────────────
     let rerank_start = Instant::now();
-    let rerank_output = reranker::rerank(query, &merged, &numbered, min_prune_lines, llm_client).await;
+    let rerank_output = reranker::rerank(query, &merged, &numbered, &caller_stats, min_prune_lines, llm_client).await;
     let rerank_ms = rerank_start.elapsed().as_millis() as u64;
 
     // ── Step 7: Format ────────────────────────────────────────────────────
@@ -206,6 +217,8 @@ pub async fn run_query(
     let mut results: Vec<CodeResult> = Vec::new();
     for (k, &idx) in rerank_output.reranked_indices.iter().enumerate() {
         let Some(chunk) = merged.get(idx) else { continue };
+        let stats = caller_stats.get(idx).copied().flatten();
+        let (callers, caller_files) = stats.map_or((None, None), |s| (Some(s.0), Some(s.1)));
         let numbered_text = numbered.get(idx).and_then(|n| n.as_deref());
         let selection = rerank_output.line_selections.get(k).and_then(|s| s.as_ref());
         match (numbered_text, selection) {
@@ -218,6 +231,8 @@ pub async fn run_query(
                         score: chunk.score,
                         content: slice_numbered(text, chunk.line_start, s, e),
                         symbol: chunk.symbol.clone(),
+                        callers,
+                        caller_files,
                     });
                 }
             }
@@ -228,6 +243,8 @@ pub async fn run_query(
                 score: chunk.score,
                 content: text.to_string(),
                 symbol: chunk.symbol.clone(),
+                callers,
+                caller_files,
             }),
             (None, _) => results.push(CodeResult {
                 file: chunk.file.clone(),
@@ -236,6 +253,8 @@ pub async fn run_query(
                 score: chunk.score,
                 content: chunk.content.clone(),
                 symbol: chunk.symbol.clone(),
+                callers,
+                caller_files,
             }),
         }
     }
@@ -247,6 +266,8 @@ pub async fn run_query(
             .get(i)
             .and_then(|n| n.clone())
             .unwrap_or_else(|| chunk.content.clone());
+        let stats = caller_stats.get(i).copied().flatten();
+        let (callers, caller_files) = stats.map_or((None, None), |s| (Some(s.0), Some(s.1)));
         pre_rerank_results.push(CodeResult {
             file: chunk.file.clone(),
             line_start: chunk.line_start,
@@ -254,6 +275,8 @@ pub async fn run_query(
             score: chunk.score,
             content,
             symbol: chunk.symbol.clone(),
+            callers,
+            caller_files,
         });
     }
 
@@ -283,17 +306,80 @@ pub async fn run_query(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-/// Fetch stored chunk content and symbol_ref from whichever DB contains the file.
+/// (callers_count, distinct_caller_files) for a single chunk's symbol.
+type CallerStats = (u32, u32);
+
+/// Batch-query caller stats for merged chunks. Returns a Vec aligned 1:1 with
+/// `merged`: `Some((count, file_count))` when the chunk has a symbol_fqn and the
+/// DB query succeeds, `None` otherwise. Bounded by merged.len() (≤ top_k).
+async fn fetch_caller_stats_batch(
+    merged: &[MergeChunk],
+    db_map: &HashMap<String, Surreal<Db>>,
+    schema_version: u32,
+) -> Vec<Option<CallerStats>> {
+    let mut stats: Vec<Option<CallerStats>> = vec![None; merged.len()];
+
+    for (i, chunk) in merged.iter().enumerate() {
+        let fqn = match &chunk.symbol_fqn {
+            Some(f) => f,
+            None => continue,
+        };
+        let db = match find_db_for_file(db_map, &chunk.file) {
+            Some(db) => db,
+            None => continue,
+        };
+
+        if let Some(s) = query_caller_stats(db, fqn, schema_version).await {
+            stats[i] = Some(s);
+        }
+    }
+    stats
+}
+
+#[derive(serde::Deserialize)]
+struct CallerRow {
+    in_file: String,
+}
+
+async fn query_caller_stats(
+    db: &Surreal<Db>,
+    fqn: &str,
+    schema_version: u32,
+) -> Option<CallerStats> {
+    let rows: Vec<CallerRow> = if schema_version >= 2 {
+        db.query("SELECT in_file FROM calls WHERE out_name = $fqn")
+            .bind(("fqn", fqn.to_string()))
+            .await
+            .ok()?
+            .take(0)
+            .ok()?
+    } else {
+        let name = fqn.rsplit("::").next().unwrap_or(fqn);
+        db.query("SELECT in_file FROM calls WHERE out_name = $name")
+            .bind(("name", name.to_string()))
+            .await
+            .ok()?
+            .take(0)
+            .ok()?
+    };
+
+    let count = rows.len() as u32;
+    let distinct_files: HashSet<&str> = rows.iter().map(|r| r.in_file.as_str()).collect();
+    let file_count = distinct_files.len() as u32;
+    Some((count, file_count))
+}
+
+/// Fetch stored chunk content, symbol short name, and full FQN from whichever DB contains the file.
 #[allow(clippy::result_large_err)]
 async fn fetch_chunk_content(
     db_map: &HashMap<String, Surreal<Db>>,
     file: &str,
     line_start: u32,
     line_end: u32,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, Option<String>) {
     let db = match find_db_for_file(db_map, file) {
         Some(db) => db,
-        None => return (String::new(), None),
+        None => return (String::new(), None, None),
     };
 
     let rows: Result<Vec<ChunkContentRow>, _> = db
@@ -310,20 +396,26 @@ async fn fetch_chunk_content(
     match rows {
         Ok(rows) => {
             if let Some(row) = rows.into_iter().next() {
-                // symbol_ref is stored as "symbol:⟨fqn⟩" — extract the name part.
-                let symbol = row.symbol_ref.as_deref().and_then(|s| {
-                    s.strip_prefix("symbol:⟨")
-                        .and_then(|s| s.strip_suffix("⟩"))
-                        .map(|fqn| fqn.rsplit("::").next().unwrap_or(fqn).to_string())
-                });
-                (row.content, symbol)
+                // symbol_ref is stored as "symbol:⟨fqn⟩" — extract both full FQN and short name.
+                let (symbol, fqn) = match row.symbol_ref.as_deref() {
+                    Some(s) => {
+                        let full_fqn = s.strip_prefix("symbol:⟨")
+                            .and_then(|s| s.strip_suffix("⟩"))
+                            .map(|f| f.to_string());
+                        let short_name = full_fqn.as_deref()
+                            .map(|fqn| fqn.rsplit("::").next().unwrap_or(fqn).to_string());
+                        (short_name, full_fqn)
+                    }
+                    None => (None, None),
+                };
+                (row.content, symbol, fqn)
             } else {
-                (String::new(), None)
+                (String::new(), None, None)
             }
         }
         Err(e) => {
             warn!(error = %e, file = %file, "failed to fetch chunk content");
-            (String::new(), None)
+            (String::new(), None, None)
         }
     }
 }

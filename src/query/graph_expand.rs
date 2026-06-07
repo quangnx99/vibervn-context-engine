@@ -17,6 +17,7 @@ pub struct ExpandedChunk {
     pub score: f32,
     pub content: String,
     pub symbol: Option<String>,
+    pub symbol_fqn: Option<String>,
 }
 
 // ─── DB row types ──────────────────────────────────────────────────────────
@@ -319,5 +320,6 @@ async fn fetch_chunk_for_fqn(
         score,
         content: row.content,
         symbol: Some(sym.name),
+        symbol_fqn: Some(strip_id_brackets(&sym.fqn)),
     })
 }

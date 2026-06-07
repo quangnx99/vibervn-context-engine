@@ -26,6 +26,7 @@ pub async fn rerank(
     query: &str,
     chunks: &[MergeChunk],
     numbered: &[Option<String>],
+    caller_stats: &[Option<(u32, u32)>],
     min_prune_lines: u32,
     llm_client: Option<&LlmClient>,
 ) -> RerankOutput {
@@ -103,7 +104,11 @@ pub async fn rerank(
     // could not be read — such chunks are NOT line-prunable downstream.
     let mut entries = Vec::with_capacity(n);
     for (i, chunk) in chunks.iter().enumerate() {
-        let meta_str = format!("score={:.2}", chunk.score);
+        let stats = caller_stats.get(i).copied().flatten();
+        let meta_str = match stats {
+            Some((callers, files)) => format!("score={:.2} callers={callers} files={files}", chunk.score),
+            None => format!("score={:.2}", chunk.score),
+        };
         let symbol_display = chunk.symbol.as_deref().unwrap_or("no symbol");
 
         let raw = numbered
@@ -394,6 +399,7 @@ mod tests {
             score: 1.0,
             content: "stored".to_owned(),
             symbol: None,
+            symbol_fqn: None,
         }
     }
 

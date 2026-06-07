@@ -450,9 +450,13 @@ async fn do_query(
                 if !out.is_empty() {
                     out.push('\n');
                 }
+                let caller_tag = match (r.callers, r.caller_files) {
+                    (Some(c), Some(f)) => format!(" [callers:{c} files:{f}]"),
+                    _ => String::new(),
+                };
                 out.push_str(&format!(
-                    "{}#L{}-{}\n{}",
-                    r.file, r.line_start, r.line_end, r.content
+                    "{}#L{}-{}{}\n{}",
+                    r.file, r.line_start, r.line_end, caller_tag, r.content
                 ));
             }
             out

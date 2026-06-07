@@ -10,6 +10,8 @@ pub struct MergeChunk {
     /// Pre-fetched content (may be empty string; will be re-read after merge).
     pub content: String,
     pub symbol: Option<String>,
+    /// Full qualified name from the symbol table (e.g. "src/foo.rs::Mod::func").
+    pub symbol_fqn: Option<String>,
 }
 
 /// Dedup + merge adjacent chunks, then cap to `top_k`.
@@ -92,6 +94,9 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
                         }
                         if current.symbol.is_none() && next.symbol.is_some() {
                             current.symbol = next.symbol;
+                        }
+                        if current.symbol_fqn.is_none() && next.symbol_fqn.is_some() {
+                            current.symbol_fqn = next.symbol_fqn;
                         }
                     }
                 } else {
