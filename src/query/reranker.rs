@@ -339,22 +339,16 @@ fn decide_final_action(exit: LoopExit, accumulated_count: usize) -> FinalAction 
     }
 }
 
-/// Pure post-response budget decision, encoding the priority: a char-budget stop
-/// (a HARD mid-turn cap, already detected during dispatch and passed as
-/// `char_stop`) ALWAYS wins over the query-budget boundary check. Returns the
-/// `LoopExit` to break with, or `None` to continue the loop.
+/// Pure post-response budget decision. A char-budget stop (a HARD mid-turn
+/// cap, already detected during dispatch and passed as `char_stop`) is the
+/// only thing checked here. Query-budget enforcement lives in the dispatch
+/// loop: after add_chunks when `awaiting_query && query_calls >= budget`, and
+/// as a rejection on the next `query` call. This ensures the agent always gets
+/// one more turn to call add_chunks after exhausting the query budget.
 ///
-/// Isolated so the char-vs-query priority is unit-testable without driving a
-/// full loop. The live loop calls this at the response boundary.
-fn boundary_exit(char_stop: Option<LoopExit>, query_calls: u32, query_budget: u32) -> Option<LoopExit> {
-    // Char budget first — it is the hard cap and takes priority on a tie.
-    if let Some(reason) = char_stop {
-        return Some(reason);
-    }
-    if query_calls >= query_budget {
-        return Some(LoopExit::QueryBudget);
-    }
-    None
+/// Isolated so the char stop is unit-testable without driving a full loop.
+fn boundary_exit(char_stop: Option<LoopExit>) -> Option<LoopExit> {
+    char_stop
 }
 
 /// External IO the agentic loop depends on. The real impl (`LiveBackend`)
@@ -501,6 +495,10 @@ async fn run_agentic_loop<B: AgenticBackend>(
         CRITICAL: Each add_chunks call is FINAL for that set of chunks. Include EVERY relevant chunk in that single call. You will NOT get another chance to add from the same set.\n\
         RULES:\n\
         - For each chunk, you MUST specify either `lines` (to prune to specific line ranges) or `keep: \"all\"` (to keep the entire chunk). Never omit both.\n\
+        - PRECISION REQUIREMENT: Use `lines` to select ONLY the specific line ranges that answer the query. \
+        `keep: \"all\"` should ONLY be used when the ENTIRE chunk (every single line) is directly relevant. \
+        For most chunks, only a subset of lines matter — use `lines: [[start, end], ...]` with the absolute line numbers shown in the chunk to pick exactly those ranges. \
+        Being precise with line ranges produces better results and conserves your character budget.\n\
         - You have a limited query budget and a character budget for total added content.\n\
         - Each query MUST use a different information_request string. Repeating the same query is not allowed.";
 
@@ -565,6 +563,15 @@ async fn run_agentic_loop<B: AgenticBackend>(
     // A second add_chunks while this is true is rejected with an error nudging
     // the model toward query.
     let mut awaiting_query = false;
+
+    // True when the most recent `query` fetched results the model has NOT yet
+    // had a turn to harvest via add_chunks. If a resource cap (byte/iteration)
+    // then cuts the loop, those results would be silently discarded and the run
+    // would end on a wasted `query` — so we grant one final forced harvest turn
+    // after the loop (see the finalization block below). Set true after a query
+    // runs; cleared once add_chunks is dispatched (whether or not it picks from
+    // that query's results — the model HAD its chance).
+    let mut unharvested_query = false;
 
     // Hard safety ceiling on TOTAL iterations. Bounds an agent that neither
     // finishes, queries to its budget, nor trips the char budget. Derived from
@@ -635,6 +642,9 @@ async fn run_agentic_loop<B: AgenticBackend>(
                             );
                             accumulated_chars = accumulated_chars.saturating_add(added_chars);
                             awaiting_query = true;
+                            // The model got its turn to harvest — clear the flag
+                            // regardless of which set it actually pulled from.
+                            unharvested_query = false;
                             tool_results.push(ToolResult {
                                 name: "add_chunks".to_owned(),
                                 id: call.id.clone(),
@@ -656,6 +666,18 @@ async fn run_agentic_loop<B: AgenticBackend>(
                         }
                         "query" => {
                             awaiting_query = false;
+                            // Reject if query budget exhausted — agent should
+                            // add_chunks from existing results or stop.
+                            if query_calls >= query_budget {
+                                tool_results.push(ToolResult {
+                                    name: "query".to_owned(),
+                                    id: call.id.clone(),
+                                    content: "Error: query budget exhausted. \
+                                        Use add_chunks to select from existing results, or stop."
+                                        .to_owned(),
+                                });
+                                continue;
+                            }
                             let info_req = call.args.get("information_request")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
@@ -670,11 +692,22 @@ async fn run_agentic_loop<B: AgenticBackend>(
                             // (not rejected as duplicate/empty).
                             if !result_content.starts_with("Error:") {
                                 query_calls += 1;
+                                // Fetched fresh results the model hasn't harvested
+                                // yet — guard against a resource cap discarding them.
+                                unharvested_query = true;
                             }
+                            // When query budget is now exhausted, append a nudge
+                            // so the model calls add_chunks next instead of stopping.
+                            let content = if query_calls >= query_budget && !result_content.starts_with("Error:") {
+                                format!("{result_content}\n\n--- Query budget exhausted. \
+                                    You MUST call add_chunks now with any relevant chunks from these results.")
+                            } else {
+                                result_content
+                            };
                             tool_results.push(ToolResult {
                                 name: "query".to_owned(),
                                 id: call.id.clone(),
-                                content: result_content,
+                                content,
                             });
                         }
                         other => {
@@ -690,17 +723,64 @@ async fn run_agentic_loop<B: AgenticBackend>(
 
                 messages.push(ChatMessage::ToolResults(tool_results));
 
-                // Post-response budget decision (pure `boundary_exit`): a
-                // mid-turn char-budget stop (hard cap, `stop_mid_turn`) takes
-                // priority over the query-budget boundary count. Chunks committed
-                // before the stop are kept regardless of which fires.
-                if let Some(reason) = boundary_exit(stop_mid_turn, query_calls, query_budget) {
+                // Post-response budget decision: only the char-budget hard cap
+                // stops here. Query budget is enforced earlier (mid-turn after
+                // add_chunks, or as a rejection on the next query call).
+                if let Some(reason) = boundary_exit(stop_mid_turn) {
                     tracing::info!(
                         ?reason, accumulated_chars, char_budget, query_calls, query_budget,
                         "agentic rerank: budget reached, stopping"
                     );
                     exit = reason;
                     break;
+                }
+            }
+        }
+    }
+
+    // Finalization harvest: a resource cap (byte/iteration) can cut the loop the
+    // turn AFTER a `query` ran but BEFORE the model harvested its results — the
+    // run would then end on a wasted `query` and discard fetched context. When
+    // that happens, grant exactly ONE more forced turn so the model can call
+    // add_chunks on the pending results. Scoped to ByteCap/IterationCap only:
+    // those mean a HEALTHY backend hit a resource ceiling mid-exploration.
+    // LlmError (broken backend) and AgentDone/budget exits are NOT retried.
+    // This is a single bounded extra turn — memory stays bounded.
+    if unharvested_query && matches!(exit, LoopExit::ByteCap | LoopExit::IterationCap) {
+        messages.push(ChatMessage::User(
+            "Search budget is spent and no more queries are allowed. \
+             Call add_chunks NOW with every relevant chunk from the results so far. \
+             This is your final action — do not call query.".to_owned(),
+        ));
+        match backend.next_turn(system, &messages, &tools, /*force_tool_use*/ true).await {
+            Ok(ToolTurnResult::ToolCalls(calls)) => {
+                raw_response_log.push_str(&format!("[Final harvest] TOOL_CALLS: {}\n",
+                    calls.iter().map(|c| format!("{}({})", c.name, c.args)).collect::<Vec<_>>().join(", ")));
+                for call in &calls {
+                    // Only add_chunks is honored here; query is explicitly refused
+                    // so the harvest turn cannot spend more budget or recurse.
+                    if call.name == "add_chunks" && !awaiting_query {
+                        let (_summary, added_chars) = handle_add_chunks(
+                            &call.args,
+                            &extended_chunks,
+                            &extended_numbered,
+                            min_prune_lines,
+                            &mut accumulated,
+                            accumulated_chars,
+                            char_budget,
+                        );
+                        accumulated_chars = accumulated_chars.saturating_add(added_chars);
+                        awaiting_query = true;
+                    }
+                }
+            }
+            // Text, error, or transport failure on the harvest turn: nothing to
+            // add — fall through with whatever was already accumulated.
+            other => {
+                if let Ok(ToolTurnResult::Text(t)) = &other {
+                    raw_response_log.push_str(&format!("[Final harvest] TEXT: {t}\n"));
+                } else if let Err(e) = &other {
+                    raw_response_log.push_str(&format!("[Final harvest] ERROR: {e}\n"));
                 }
             }
         }
@@ -1835,6 +1915,39 @@ mod tests {
     }
 
     #[test]
+    fn loop_byte_cap_after_query_grants_final_harvest() {
+        // Bug: query fetches results, then byte cap trips at the top of the
+        // next iteration — before the model can harvest. Without finalization
+        // the run ends on a wasted query (0 accumulated → fallback). With it,
+        // the model gets one forced add_chunks turn and the chunk is committed.
+        let big = MergeChunk {
+            file: "/big.rs".to_owned(),
+            line_start: 1,
+            line_end: 1,
+            score: 1.0,
+            content: "x".repeat(250_000),
+            symbol: None,
+            symbol_fqn: None,
+        };
+        let backend = MockBackend::with_sub_query(
+            vec![
+                // Turn 0: query loads the oversized chunk (base_n=2 → idx 2).
+                MockTurn::Calls(vec![ToolCall {
+                    name: "query".to_owned(), id: Some("q".into()),
+                    args: json!({ "information_request": "x" }), ..Default::default()
+                }]),
+                // Turn 1 never starts: byte cap trips → ByteCap exit.
+                // Final harvest turn: model commits the sub-query chunk.
+                MockTurn::Calls(vec![add_chunk_call(2)]),
+            ],
+            vec![big],
+        );
+        let (out, _pool) = run_loop(&backend, 2, 9);
+        assert_eq!(out.reranked_indices, vec![2], "sub-query chunk harvested in final turn");
+        assert!(!out.fallback_used, "harvested → UseAccumulated, not fallback");
+    }
+
+    #[test]
     fn loop_llm_error_with_accumulated_keeps_chunks() {
         // Turn 0: add_chunks([2, 0]) in one call. Turn 1: HTTP error.
         // Expect [2, 0] kept, NOT fallback.
@@ -1996,9 +2109,9 @@ mod tests {
     // ── Turn-budget semantics (turns = query calls) ─────────────────────────
 
     #[test]
-    fn budget_counts_query_calls_and_stops() {
-        // max_turns = 2 (query budget). Two query turns with different strings
-        // spend the budget; the loop stops at the response boundary.
+    fn budget_counts_query_calls_and_allows_final_add_chunks() {
+        // max_turns = 2 (query budget). Two query turns spend the budget, but
+        // the agent gets one more turn to add_chunks before the loop stops.
         let sub = vec![chunk(50, 60)];
         let backend = MockBackend::with_sub_query(
             vec![
@@ -2011,16 +2124,14 @@ mod tests {
                     name: "query".to_owned(), id: Some("q2".into()),
                     args: json!({ "information_request": "second query" }),
                     ..Default::default()
-                }]),                                            // query 2/2 → STOP after this turn
-                MockTurn::Calls(vec![add_chunk_call(0)]),       // must NOT be reached
+                }]),                                            // query 2/2
+                MockTurn::Calls(vec![add_chunk_call(0)]),       // agent gets to add_chunks
             ],
             sub,
         );
-        // 0 chunks committed, exited via QueryBudget → fallback to original order.
         let (out, _pool) = run_loop(&backend, 2, 2);
-        assert!(out.fallback_used, "query budget hit with 0 chunks → fallback");
-        assert_eq!(out.reranked_indices, vec![0, 1], "fallback = original order");
-        assert!(out.skip_reason.as_deref().unwrap().contains("query budget"));
+        assert_eq!(out.reranked_indices, vec![0], "agent could add_chunks after query budget exhausted");
+        assert!(!out.fallback_used);
     }
 
     #[test]
@@ -2144,19 +2255,11 @@ mod tests {
     }
 
     #[test]
-    fn char_budget_takes_priority_over_query_budget_on_tie() {
-        // Decisive ordering proof against the pure `boundary_exit` the loop uses:
-        // when a char stop is already flagged AND the query budget is also
-        // exhausted in the same response, ChunkCharBudget wins.
-        let exit = boundary_exit(Some(LoopExit::ChunkCharBudget), /*query_calls*/ 3, /*budget*/ 3);
-        assert_eq!(exit, Some(LoopExit::ChunkCharBudget), "char stop wins the tie");
-
-        // No char stop, query budget exhausted → QueryBudget.
-        assert_eq!(boundary_exit(None, 3, 3), Some(LoopExit::QueryBudget));
-        // Neither tripped → continue.
-        assert_eq!(boundary_exit(None, 1, 3), None);
-        // Char stop with query budget NOT exhausted → still ChunkCharBudget.
-        assert_eq!(boundary_exit(Some(LoopExit::ChunkCharBudget), 0, 3), Some(LoopExit::ChunkCharBudget));
+    fn boundary_exit_only_checks_char_stop() {
+        // boundary_exit now only gates on the char-budget hard cap.
+        // Query budget is enforced in the dispatch loop, not here.
+        assert_eq!(boundary_exit(Some(LoopExit::ChunkCharBudget)), Some(LoopExit::ChunkCharBudget));
+        assert_eq!(boundary_exit(None), None);
     }
 
     #[test]
