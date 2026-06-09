@@ -143,6 +143,14 @@ fn default_use_structured_output() -> bool {
     true
 }
 
+fn default_agentic_rag_max_turns() -> u32 {
+    3
+}
+
+fn default_agentic_rag_max_chunk_chars() -> u32 {
+    50_000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LlmConfig {
     pub provider: String,
@@ -157,6 +165,21 @@ pub struct LlmConfig {
     /// others fall back to the XML path with a warning. Defaults to true.
     #[serde(default = "default_use_structured_output")]
     pub use_structured_output: bool,
+    /// When true, the rerank step uses a tool-calling agent loop instead of a
+    /// single-shot LLM call. The agent uses `query` (search for more context)
+    /// and `add_chunks` (commit relevant chunks) to build the final result.
+    #[serde(default)]
+    pub agentic_rag: bool,
+    /// Turn budget for the agentic loop, counted as the number of `query` tool
+    /// calls. When the agent has issued this many queries, the loop stops.
+    /// Defaults to 3.
+    #[serde(default = "default_agentic_rag_max_turns")]
+    pub agentic_rag_max_turns: u32,
+    /// Character budget for accumulated chunk content in the agentic loop. Once
+    /// the total emitted characters of added chunks reaches this, the agent
+    /// stops. 0 disables the cap. Defaults to 50000.
+    #[serde(default = "default_agentic_rag_max_chunk_chars")]
+    pub agentic_rag_max_chunk_chars: u32,
 }
 
 impl Default for LlmConfig {
@@ -167,6 +190,9 @@ impl Default for LlmConfig {
             api_keys: Vec::new(),
             rerank_min_prune_lines: default_min_prune_lines(),
             use_structured_output: default_use_structured_output(),
+            agentic_rag: false,
+            agentic_rag_max_turns: default_agentic_rag_max_turns(),
+            agentic_rag_max_chunk_chars: default_agentic_rag_max_chunk_chars(),
         }
     }
 }
@@ -724,5 +750,59 @@ mod tests {
             "explicit empty list must not be overwritten by serde default; got: {:?}",
             loaded.index_ignore_filenames
         );
+    }
+
+    /// Backward-compat: an existing user's settings.json (already at v6, the
+    /// current schema) whose `llm` block predates the Agentic RAG fields must
+    /// load WITHOUT a deserialize error and fill both fields from serde defaults
+    /// (agentic_rag=false, agentic_rag_max_turns=3). Adding these fields was an
+    /// additive-with-defaults change, so no version bump/migration was needed —
+    /// this test pins that the defaults actually apply on an old-shaped file.
+    #[test]
+    fn test_v6_missing_agentic_rag_fields_default_cleanly() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        // Note: `llm` has provider/rerank_model/api_keys only — NO agentic_rag,
+        // NO agentic_rag_max_turns, NO rerank_min_prune_lines, NO
+        // use_structured_output. Exactly an upgraded-from-older-build file.
+        let v6 = r#"{
+            "version": 6,
+            "repos": [],
+            "embedding": {"provider":"voyage","model":"voyage-4-lite","api_keys":[],"embed_concurrency":16},
+            "llm": {"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]},
+            "data_dir": null,
+            "embeddings_dir": null,
+            "enabled_mcp_tools": ["codebase-retrieval","file-retrieval"],
+            "custom_extensions": [],
+            "index_ignore_filenames": []
+        }"#;
+        fs::write(&path, v6).expect("write v6 settings.json");
+
+        // Must NOT error on the missing fields.
+        let loaded = ensure_dir_and_load(home.path()).expect("load v6 missing agentic fields");
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert!(!loaded.llm.agentic_rag, "agentic_rag must default to false on old files");
+        assert_eq!(
+            loaded.llm.agentic_rag_max_turns, 3,
+            "agentic_rag_max_turns must default to 3 on old files"
+        );
+        assert_eq!(
+            loaded.llm.agentic_rag_max_chunk_chars, 50_000,
+            "agentic_rag_max_chunk_chars must default to 50000 on old files"
+        );
+    }
+
+    /// Direct deserialization guard: parsing an `LlmConfig` from JSON with the
+    /// agentic fields absent succeeds and yields the documented defaults. This
+    /// is the narrowest possible proof, independent of the file-load path.
+    #[test]
+    fn test_llm_config_deserializes_without_agentic_fields() {
+        let json = r#"{"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":["k"]}"#;
+        let cfg: LlmConfig = serde_json::from_str(json).expect("deserialize old llm block");
+        assert!(!cfg.agentic_rag);
+        assert_eq!(cfg.agentic_rag_max_turns, 3);
+        assert_eq!(cfg.agentic_rag_max_chunk_chars, 50_000);
     }
 }

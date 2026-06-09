@@ -908,6 +908,9 @@ async fn post_query(
         settings.llm.rerank_min_prune_lines,
         llm_client.as_ref(),
         std::time::Duration::from_secs(settings.mcp_index_wait_secs),
+        settings.llm.agentic_rag,
+        settings.llm.agentic_rag_max_turns,
+        settings.llm.agentic_rag_max_chunk_chars,
     )
     .await
     {

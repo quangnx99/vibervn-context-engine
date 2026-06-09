@@ -185,13 +185,13 @@ impl McpHandler {
         name = "codebase-retrieval",
         description = "\
 IMPORTANT: This is the primary tool for searching the codebase. Please consider as the FIRST \
-CHOICE for any codebase searches. This MCP tool is the world's best codebase context engine. \
-It: 1. Takes in a natural language description of the code you are looking for; 2. Uses a \
-proprietary retrieval/embedding model suite that produces the highest-quality recall of \
-relevant code snippets from across the codebase; 3. Maintains a real-time index of the \
-codebase, so the results are always up-to-date and reflects the current state of the codebase; \
-4. Can retrieve across different programming languages; 5. Only reflects the current state of \
-the codebase on the disk, and has no information on version control or code history. The \
+CHOICE for any codebase searches. It performs semantic code search: 1. Takes in a natural \
+language description of the code you are looking for; 2. Retrieves the most relevant code \
+snippets across the codebase using embedding-based vector search, call-graph expansion of the \
+matched symbols, and optional LLM reranking; 3. Maintains a real-time index of the codebase, \
+so results reflect the current state of the code on disk; 4. Can retrieve across different \
+programming languages; 5. Only reflects the current state of the codebase on the disk, and \
+has no information on version control or code history. The \
 codebase-retrieval MCP tool should be used in the following cases: * When you don't know which \
 files contain the information you need * When you want to gather high level information about \
 the task you are trying to accomplish * When you want to gather information about the codebase \
@@ -209,7 +209,7 @@ codebase-retrieval MCP tool. <RULES> # Tool Selection for Code Search CRITICAL: 
 for code, classes, functions, or understanding the codebase: -ALWAYS use codebase-retrieval \
 MCP tool as your PRIMARY tool for code search - DO NOT use Bash commands (find, grep, ag, rg, \
 etc.) or Grep tool for semantic code understanding - The codebase-retrieval MCP tool uses \
-advanced semantic search and is specifically designed for code understanding - Bash/Grep are \
+embedding-based semantic search and is specifically designed for code understanding - Bash/Grep are \
 only appropriate for exact string matching of non-code content (like error messages, config \
 values, or log entries) - When in doubt between Bash/Grep and codebase-retrieval MCP, ALWAYS \
 choose codebase-retrieval MCP # Preliminary tasks and planning Before starting to execute a \
@@ -349,13 +349,13 @@ impl RepoMcpHandler {
         name = "codebase-retrieval",
         description = "\
 IMPORTANT: This is the primary tool for searching the codebase. Please consider as the FIRST \
-CHOICE for any codebase searches. This MCP tool is the world's best codebase context engine. \
-It: 1. Takes in a natural language description of the code you are looking for; 2. Uses a \
-proprietary retrieval/embedding model suite that produces the highest-quality recall of \
-relevant code snippets from across the codebase; 3. Maintains a real-time index of the \
-codebase, so the results are always up-to-date and reflects the current state of the codebase; \
-4. Can retrieve across different programming languages; 5. Only reflects the current state of \
-the codebase on the disk, and has no information on version control or code history. The \
+CHOICE for any codebase searches. It performs semantic code search: 1. Takes in a natural \
+language description of the code you are looking for; 2. Retrieves the most relevant code \
+snippets across the codebase using embedding-based vector search, call-graph expansion of the \
+matched symbols, and optional LLM reranking; 3. Maintains a real-time index of the codebase, \
+so results reflect the current state of the code on disk; 4. Can retrieve across different \
+programming languages; 5. Only reflects the current state of the codebase on the disk, and \
+has no information on version control or code history. The \
 codebase-retrieval MCP tool should be used in the following cases: * When you don't know which \
 files contain the information you need * When you want to gather high level information about \
 the task you are trying to accomplish * When you want to gather information about the codebase \
@@ -373,7 +373,7 @@ codebase-retrieval MCP tool. <RULES> # Tool Selection for Code Search CRITICAL: 
 for code, classes, functions, or understanding the codebase: -ALWAYS use codebase-retrieval \
 MCP tool as your PRIMARY tool for code search - DO NOT use Bash commands (find, grep, ag, rg, \
 etc.) or Grep tool for semantic code understanding - The codebase-retrieval MCP tool uses \
-advanced semantic search and is specifically designed for code understanding - Bash/Grep are \
+embedding-based semantic search and is specifically designed for code understanding - Bash/Grep are \
 only appropriate for exact string matching of non-code content (like error messages, config \
 values, or log entries) - When in doubt between Bash/Grep and codebase-retrieval MCP, ALWAYS \
 choose codebase-retrieval MCP # Preliminary tasks and planning Before starting to execute a \
@@ -929,6 +929,9 @@ async fn do_query(
         settings.llm.rerank_min_prune_lines,
         llm_client.as_ref(),
         Duration::from_secs(settings.mcp_index_wait_secs),
+        settings.llm.agentic_rag,
+        settings.llm.agentic_rag_max_turns,
+        settings.llm.agentic_rag_max_chunk_chars,
     )
     .await
     {

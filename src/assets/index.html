@@ -278,6 +278,41 @@
           LLM Keys
         </h2>
         <div class="mb-4">
+          <label class="flex items-center gap-2 text-xs font-medium text-gray-500 dark:text-wiki-text-muted cursor-pointer">
+            <input id="llm-agentic-rag" type="checkbox"
+                   class="h-4 w-4 rounded border-gray-300 dark:border-wiki-border text-blue-600
+                          focus:outline-none focus:ring-2 focus:ring-blue-400" />
+            <span data-i18n="llm.agenticRag">Agentic RAG</span>
+          </label>
+          <p data-i18n="llm.agenticRagHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
+            Run reranking as an agent: it uses query and add_chunks tools to build the final results, searching for more context when needed.
+          </p>
+        </div>
+        <div id="llm-agentic-max-turns-wrapper" class="mb-4 hidden">
+          <label data-i18n="llm.maxTurns" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="llm-agentic-max-turns">
+            Max turns
+          </label>
+          <input id="llm-agentic-max-turns" type="number" min="1" max="10" step="1" placeholder="3"
+                 class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
+                        placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                        focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+          <p data-i18n="llm.maxTurnsHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
+            Turn budget for the agent, counted as the number of query calls.
+          </p>
+        </div>
+        <div id="llm-agentic-max-chunk-chars-wrapper" class="mb-4 hidden">
+          <label data-i18n="llm.maxChunkChars" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="llm-agentic-max-chunk-chars">
+            Max chunk chars
+          </label>
+          <input id="llm-agentic-max-chunk-chars" type="number" min="0" step="1000" placeholder="50000"
+                 class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
+                        placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                        focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+          <p data-i18n="llm.maxChunkCharsHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
+            Character budget for added chunks. The agent stops once added chunk content reaches this. 0 disables the limit.
+          </p>
+        </div>
+        <div class="mb-4">
           <label data-i18n="field.provider" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1">Provider</label>
           <select id="llm-provider"
                   class="border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
@@ -1071,6 +1106,18 @@ const STR = {
   'llm.structuredHelp':{ en: `Request the provider's native JSON output for reranking instead of XML tags. Providers without a JSON mode fall back to the XML path automatically.`,
                          vi: `Yêu cầu output JSON gốc của provider để rerank thay vì thẻ XML. Provider không hỗ trợ JSON sẽ tự động dùng đường XML.`,
                          zh: `请求提供商的原生 JSON 输出用于重排序，而非 XML 标签。不支持 JSON 模式的提供商会自动回退到 XML 方式。` },
+  'llm.agenticRag':    { en: `Agentic RAG`, vi: `Agentic RAG`, zh: `Agentic RAG` },
+  'llm.agenticRagHelp':{ en: `Run reranking as an agent: it uses query and add_chunks tools to build the final results, searching for more context when needed.`,
+                         vi: `Chạy rerank dạng agent: agent dùng tool query và add_chunks để tạo kết quả cuối, tự query thêm context khi cần.`,
+                         zh: `以代理方式运行重排序：代理使用 query 和 add_chunks 工具构建最终结果，并在需要时搜索更多上下文。` },
+  'llm.maxTurns':      { en: `Max turns`, vi: `Max turns`, zh: `最大轮次` },
+  'llm.maxTurnsHelp':  { en: `Turn budget for the agent, counted as the number of query calls.`,
+                         vi: `Turn budget của agent, tính theo số lần gọi query.`,
+                         zh: `代理的轮次预算，按 query 调用次数计算。` },
+  'llm.maxChunkChars': { en: `Max chunk chars`, vi: `Max chunk chars`, zh: `最大 chunk 字符数` },
+  'llm.maxChunkCharsHelp': { en: `Character budget for added chunks. The agent stops once added chunk content reaches this. 0 disables the limit.`,
+                         vi: `Character budget cho chunks đã add. Agent dừng khi nội dung chunks đã add đạt mức này. 0 để tắt giới hạn.`,
+                         zh: `已添加 chunk 的字符预算。当已添加的 chunk 内容达到此值时代理停止。设为 0 可禁用此限制。` },
   'settings.setupHint':{ en: `Add an embedding API key below to start indexing repositories.`, vi: `Thêm embedding API key bên dưới để bắt đầu index repo.`, zh: `在下方添加嵌入 API 密钥即可开始索引仓库。` },
   'settings.mcpTools': { en: `MCP Tools`, vi: `MCP Tools`, zh: `MCP 工具` },
   'settings.mcpToolsHelp': { en: `Choose which MCP tools are exposed to clients. Disabled tools are hidden from tool lists.`, vi: `Chọn MCP tool nào được expose cho client. Tool bị tắt sẽ ẩn khỏi danh sách tool.`, zh: `选择向客户端公开哪些 MCP 工具。禁用的工具将从工具列表中隐藏。` },
@@ -1652,6 +1699,11 @@ function renderAll() {
   document.getElementById('llm-rerank-model').value = cfg.llm.rerank_model || '';
   document.getElementById('llm-min-prune-lines').value = cfg.llm.rerank_min_prune_lines ?? 16;
   document.getElementById('llm-use-structured-output').checked = cfg.llm.use_structured_output ?? true;
+  document.getElementById('llm-agentic-rag').checked = cfg.llm.agentic_rag ?? false;
+  document.getElementById('llm-agentic-max-turns').value = cfg.llm.agentic_rag_max_turns ?? 3;
+  document.getElementById('llm-agentic-max-chunk-chars').value = cfg.llm.agentic_rag_max_chunk_chars ?? 50000;
+  document.getElementById('llm-agentic-max-turns-wrapper').classList.toggle('hidden', !(cfg.llm.agentic_rag ?? false));
+  document.getElementById('llm-agentic-max-chunk-chars-wrapper').classList.toggle('hidden', !(cfg.llm.agentic_rag ?? false));
   renderKeyList('llm-keys-list', cfg.llm.api_keys, (idx) => {
     cfg.llm.api_keys.splice(idx, 1);
     renderAll();
@@ -1907,6 +1959,25 @@ document.getElementById('llm-min-prune-lines').addEventListener('input', (e) => 
 });
 document.getElementById('llm-use-structured-output').addEventListener('change', (e) => {
   if (cfg) { cfg.llm.use_structured_output = e.target.checked; saveNow(); }
+});
+document.getElementById('llm-agentic-rag').addEventListener('change', (e) => {
+  if (!cfg) return;
+  cfg.llm.agentic_rag = e.target.checked;
+  document.getElementById('llm-agentic-max-turns-wrapper').classList.toggle('hidden', !e.target.checked);
+  document.getElementById('llm-agentic-max-chunk-chars-wrapper').classList.toggle('hidden', !e.target.checked);
+  saveNow();
+});
+document.getElementById('llm-agentic-max-turns').addEventListener('input', (e) => {
+  if (!cfg) return;
+  const n = parseInt(e.target.value, 10);
+  cfg.llm.agentic_rag_max_turns = (Number.isInteger(n) && n >= 1) ? n : 3;
+  saveDebounced();
+});
+document.getElementById('llm-agentic-max-chunk-chars').addEventListener('input', (e) => {
+  if (!cfg) return;
+  const n = parseInt(e.target.value, 10);
+  cfg.llm.agentic_rag_max_chunk_chars = (Number.isInteger(n) && n >= 0) ? n : 50000;
+  saveDebounced();
 });
 function syncEnabledMcpTools() {
   if (!cfg) return;

@@ -1,8 +1,19 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 use regex::Regex;
+use surrealdb::Surreal;
+use surrealdb::engine::local::Db;
+use tokio::sync::RwLock;
 use tracing::warn;
-use crate::llm::LlmClient;
+use crate::embedding::voyage::VoyageClient;
+use crate::indexing::IndexEngine;
+use crate::llm::{ChatMessage, LlmClient, ToolDef, ToolResult, ToolTurnResult};
 use crate::query::merger::MergeChunk;
+use crate::query::engine::{run_sub_query, read_lines_from_fs, slice_numbered};
+
+/// A chunk selection: (chunk_index, optional line ranges to keep).
+type ChunkSelection = (usize, Option<Vec<(u32, u32)>>);
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RerankOutput {
@@ -16,6 +27,18 @@ pub struct RerankOutput {
     pub elapsed_ms: u64,
     pub fallback_used: bool,
     pub skip_reason: Option<String>,
+}
+
+/// The agentic loop's addressable chunk pool: base candidates followed by any
+/// chunks pulled in by the `query` tool. `reranked_indices` from an agentic
+/// rerank index into THIS pool (not the caller's base `merged`), so the query
+/// engine must resolve against it or sub-query selections are lost. Returned
+/// only by the agentic path; the single-shot reranker addresses `merged`.
+#[derive(Debug, Clone)]
+pub struct ExtendedPool {
+    pub chunks: Vec<MergeChunk>,
+    /// Numbered-from-disk text aligned 1:1 with `chunks` (`None` = unreadable).
+    pub numbered: Vec<Option<String>>,
 }
 
 /// Padding added on each side of an LLM-selected range before clamping to the
@@ -170,6 +193,753 @@ pub async fn rerank(
             }
         }
     }
+}
+
+// ─── Agentic RAG rerank ──────────────────────────────────────────────────
+
+const AGENTIC_HISTORY_BYTE_CAP: usize = 200_000;
+
+fn agentic_tool_definitions() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "add_chunks".to_owned(),
+            description: "Add one or more relevant code chunks to the final results, ordered most-relevant first. \
+                Each call may include many chunks at once. There is a total character budget for added \
+                chunk content; once it is reached the agent stops.".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "chunks": {
+                        "type": "array",
+                        "description": "Chunks to add to the final results, most relevant first.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "chunk_index": {
+                                    "type": "integer",
+                                    "description": "The index of the chunk to add (from the numbered chunk list)"
+                                },
+                                "lines": {
+                                    "type": "array",
+                                    "description": "Line ranges to keep from this chunk (prune mode). Each element is [start, end] using the absolute line numbers shown in the chunk. Mutually exclusive with keep.",
+                                    "items": {
+                                        "type": "array",
+                                        "items": { "type": "integer" },
+                                        "minItems": 2,
+                                        "maxItems": 2
+                                    }
+                                },
+                                "keep": {
+                                    "type": "string",
+                                    "enum": ["all"],
+                                    "description": "Set to \"all\" to keep the entire chunk. Mutually exclusive with lines."
+                                }
+                            },
+                            "required": ["chunk_index"]
+                        }
+                    }
+                },
+                "required": ["chunks"]
+            }),
+        },
+        ToolDef {
+            name: "query".to_owned(),
+            description: "Search for additional code context. Use when the current chunks are insufficient to answer the original query. Returns new chunks you can then add via add_chunks. Each query call counts against the turn budget.".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "information_request": {
+                        "type": "string",
+                        "description": "What to search for in the codebase"
+                    }
+                },
+                "required": ["information_request"]
+            }),
+        },
+    ]
+}
+
+/// Estimate byte size of conversation history for cap enforcement.
+fn estimate_history_bytes(messages: &[ChatMessage]) -> usize {
+    messages.iter().map(|m| match m {
+        ChatMessage::User(t) => t.len(),
+        ChatMessage::ModelToolCalls(calls) => calls.iter().map(|c| c.name.len() + c.args.to_string().len() + 50).sum(),
+        ChatMessage::ToolResults(results) => results.iter().map(|r| r.name.len() + r.content.len() + 50).sum(),
+    }).sum()
+}
+
+/// Why the agentic loop stopped. Captured explicitly (not inferred from log
+/// strings) so the final-output decision is a pure function of structured state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopExit {
+    /// LLM returned a text response (agent signalled it is done).
+    AgentDone,
+    /// An LLM HTTP/transport call failed mid-loop.
+    LlmError,
+    /// Agent used its query turn budget (`max_turns` `query` calls).
+    QueryBudget,
+    /// Accumulated chunk content reached the configured character budget
+    /// (`max_chunk_chars`). Implies at least one add_chunks succeeded.
+    ChunkCharBudget,
+    /// Hard safety ceiling on TOTAL loop iterations was hit. Bounds an agent
+    /// that neither finishes, queries to its budget, nor adds enough chars to
+    /// trip the char budget. Memory stays bounded by this + the byte cap.
+    IterationCap,
+    /// Conversation history exceeded `AGENTIC_HISTORY_BYTE_CAP`.
+    ByteCap,
+}
+
+/// The action the post-loop logic must take, derived purely from
+/// `(exit_reason, accumulated_count)`. This is the failure-semantics table,
+/// isolated so every row is unit-testable without a live LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalAction {
+    /// Emit the accumulated chunks as the reranked result.
+    UseAccumulated,
+    /// Emit an empty result set — the agent judged nothing relevant.
+    /// NOT a fallback (`fallback_used = false`).
+    EmptyRelevant,
+    /// Degrade to original candidate order (`fallback_used = true`).
+    Fallback,
+}
+
+/// Pure decision: given how the loop exited and how many chunks the agent
+/// committed via `add_chunks`, what should the final output be?
+///
+/// Failure-semantics table (committed contract):
+/// | exit            | accumulated == 0 | accumulated >= 1 |
+/// |-----------------|------------------|------------------|
+/// | AgentDone       | EmptyRelevant    | UseAccumulated   |
+/// | LlmError        | Fallback         | UseAccumulated   |
+/// | QueryBudget     | Fallback         | UseAccumulated   |
+/// | ChunkCharBudget | Fallback*        | UseAccumulated   |
+/// | IterationCap    | Fallback         | UseAccumulated   |
+/// | ByteCap         | Fallback         | UseAccumulated   |
+///
+/// *ChunkCharBudget with accumulated == 0 is unreachable in the live loop (the
+/// char total only grows when add_chunks commits a chunk), but the table is
+/// total: if it ever occurs, fallback is the safe choice.
+fn decide_final_action(exit: LoopExit, accumulated_count: usize) -> FinalAction {
+    if accumulated_count >= 1 {
+        // Once the agent has committed chunks, they are durable regardless of
+        // how the loop ended. Partial success is still success.
+        return FinalAction::UseAccumulated;
+    }
+    match exit {
+        // Agent explicitly finished with zero selections → it judged nothing
+        // relevant. Honor that as an empty result, not a fallback.
+        LoopExit::AgentDone => FinalAction::EmptyRelevant,
+        // Any non-graceful termination with zero selections → fallback to
+        // original order so the caller still gets candidates.
+        LoopExit::LlmError
+        | LoopExit::QueryBudget
+        | LoopExit::ChunkCharBudget
+        | LoopExit::IterationCap
+        | LoopExit::ByteCap => FinalAction::Fallback,
+    }
+}
+
+/// Pure post-response budget decision, encoding the priority: a char-budget stop
+/// (a HARD mid-turn cap, already detected during dispatch and passed as
+/// `char_stop`) ALWAYS wins over the query-budget boundary check. Returns the
+/// `LoopExit` to break with, or `None` to continue the loop.
+///
+/// Isolated so the char-vs-query priority is unit-testable without driving a
+/// full loop. The live loop calls this at the response boundary.
+fn boundary_exit(char_stop: Option<LoopExit>, query_calls: u32, query_budget: u32) -> Option<LoopExit> {
+    // Char budget first — it is the hard cap and takes priority on a tie.
+    if let Some(reason) = char_stop {
+        return Some(reason);
+    }
+    if query_calls >= query_budget {
+        return Some(LoopExit::QueryBudget);
+    }
+    None
+}
+
+/// External IO the agentic loop depends on. The real impl (`LiveBackend`)
+/// wraps the LLM client + retrieval deps; tests provide a scripted mock so the
+/// loop body, decision logic, AND output assembly run for real without any
+/// network/DB. This is what closes the drift gap — there is no parallel copy of
+/// the field-assembly code; `run_agentic_loop` is the single source of truth.
+trait AgenticBackend {
+    /// Execute one LLM tool-calling turn over the current conversation.
+    /// `force_tool_use` forbids a prose reply (the model MUST call a tool) — set
+    /// while no chunk is committed yet so the agent can't answer the query
+    /// directly instead of selecting chunks.
+    fn next_turn(
+        &self,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+        force_tool_use: bool,
+    ) -> impl std::future::Future<Output = anyhow::Result<ToolTurnResult>> + Send;
+
+    /// Retrieve additional chunks for the `query` tool
+    /// (embed → search → expand → merge; NO rerank — cannot recurse).
+    fn sub_query(
+        &self,
+        information_request: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MergeChunk>>> + Send;
+}
+
+/// Production backend: forwards to the real LLM client and `run_sub_query`.
+struct LiveBackend<'a> {
+    llm_client: &'a LlmClient,
+    repo_filter: &'a str,
+    voyage_client: &'a VoyageClient,
+    index_engine: &'a Arc<IndexEngine>,
+    repo_dbs: &'a Arc<RwLock<HashMap<String, Surreal<Db>>>>,
+    warm_wait: std::time::Duration,
+}
+
+impl AgenticBackend for LiveBackend<'_> {
+    fn next_turn(
+        &self,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+        force_tool_use: bool,
+    ) -> impl std::future::Future<Output = anyhow::Result<ToolTurnResult>> + Send {
+        self.llm_client.complete_with_tools(system, messages, tools, 0.0, force_tool_use)
+    }
+
+    fn sub_query(
+        &self,
+        information_request: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MergeChunk>>> + Send {
+        run_sub_query(
+            information_request,
+            30,
+            self.repo_filter,
+            self.voyage_client,
+            self.index_engine,
+            self.repo_dbs,
+            self.warm_wait,
+        )
+    }
+}
+
+/// Agentic rerank: multi-turn tool-calling loop. The agent selects chunks via
+/// `add_chunks` and can expand search via `query`. Structurally cannot recurse
+/// into rerank — `run_sub_query` has no LLM client and no rerank step.
+///
+/// Thin wrapper: builds the live backend and delegates to `run_agentic_loop`,
+/// which holds the actual loop + decision + output-assembly logic so tests can
+/// drive it with a mock backend.
+#[allow(clippy::too_many_arguments)]
+pub async fn rerank_agentic(
+    query: &str,
+    chunks: &[MergeChunk],
+    numbered: &[Option<String>],
+    caller_stats: &[Option<(u32, u32)>],
+    min_prune_lines: u32,
+    llm_client: &LlmClient,
+    max_turns: u32,
+    max_chunk_chars: u32,
+    // Sub-query dependencies (for the `query` tool)
+    repo_filter: &str,
+    voyage_client: &VoyageClient,
+    index_engine: &Arc<IndexEngine>,
+    repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
+    warm_wait: std::time::Duration,
+) -> (RerankOutput, ExtendedPool) {
+    let backend = LiveBackend {
+        llm_client,
+        repo_filter,
+        voyage_client,
+        index_engine,
+        repo_dbs,
+        warm_wait,
+    };
+    run_agentic_loop(&backend, query, chunks, numbered, caller_stats, min_prune_lines, max_turns, max_chunk_chars).await
+}
+
+/// The real agentic loop: prompt build → turn loop → `decide_final_action` →
+/// output assembly. Generic over the backend so unit tests exercise THIS code
+/// (not a copy) with a scripted mock.
+#[allow(clippy::too_many_arguments)]
+async fn run_agentic_loop<B: AgenticBackend>(
+    backend: &B,
+    query: &str,
+    chunks: &[MergeChunk],
+    numbered: &[Option<String>],
+    caller_stats: &[Option<(u32, u32)>],
+    min_prune_lines: u32,
+    max_turns: u32,
+    max_chunk_chars: u32,
+) -> (RerankOutput, ExtendedPool) {
+    let n = chunks.len();
+    let all_indices: Vec<usize> = (0..n).collect();
+    let start = Instant::now();
+
+    if chunks.is_empty() {
+        return (
+            RerankOutput {
+                reranked_indices: vec![],
+                line_selections: vec![],
+                raw_request: String::new(),
+                raw_response: String::new(),
+                elapsed_ms: 0,
+                fallback_used: false,
+                skip_reason: None,
+            },
+            ExtendedPool { chunks: vec![], numbered: vec![] },
+        );
+    }
+
+    let system = "You are a code search relevance agent. \
+        You are given a query and numbered code chunks with metadata. \
+        Your ONLY job is to select relevant chunks via tools. NEVER answer the query. NEVER explain or summarize.\n\
+        WORKFLOW — strict alternating cadence:\n\
+        1. Call add_chunks ONCE with ALL relevant initial chunks (most relevant first). OMIT irrelevant chunks.\n\
+        2. Call query with a NEW search string to find additional context (if needed).\n\
+        3. Call add_chunks ONCE with ALL relevant chunks from those query results. This is your ONLY chance to select from these results — you cannot go back.\n\
+        4. Repeat steps 2-3 with a DIFFERENT query string each time.\n\
+        The pattern is always: add_chunks → query → add_chunks → query → ...\n\
+        You CANNOT call add_chunks twice in a row. After each add_chunks you MUST either call query or stop.\n\
+        CRITICAL: Each add_chunks call is FINAL for that set of chunks. Include EVERY relevant chunk in that single call. You will NOT get another chance to add from the same set.\n\
+        RULES:\n\
+        - For each chunk, you MUST specify either `lines` (to prune to specific line ranges) or `keep: \"all\"` (to keep the entire chunk). Never omit both.\n\
+        - You have a limited query budget and a character budget for total added content.\n\
+        - Each query MUST use a different information_request string. Repeating the same query is not allowed.";
+
+    // Build initial user prompt with chunk entries
+    let mut entries = Vec::with_capacity(n);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let stats = caller_stats.get(i).copied().flatten();
+        let meta_str = match stats {
+            Some((callers, files)) => format!("score={:.2} callers={callers} files={files}", chunk.score),
+            None => format!("score={:.2}", chunk.score),
+        };
+        let symbol_display = chunk.symbol.as_deref().unwrap_or("no symbol");
+        let raw = numbered.get(i).and_then(|c| c.as_deref()).unwrap_or(&chunk.content);
+        let content = truncate_content(raw, 100);
+        let entry = format!(
+            "[{i}] {meta_str} | {}:{}-{} ({symbol_display})\n{content}",
+            chunk.file, chunk.line_start, chunk.line_end
+        );
+        entries.push(entry);
+    }
+
+    let chunks_text = entries.join("\n---\n");
+    let user_prompt = format!(
+        "<system-reminder>\n\
+         Strict cadence: add_chunks → query → add_chunks → query → ...\n\
+         You CANNOT call add_chunks twice in a row. After add_chunks, you MUST call query or stop.\n\
+         Each add_chunks is your ONLY chance to select from the current chunk set. Include ALL relevant chunks — you cannot go back.\n\
+         Each query MUST use a DIFFERENT information_request. Repeating the same string is forbidden.\n\
+         </system-reminder>\n\n\
+         Query: {query}\n\nChunks:\n{chunks_text}"
+    );
+
+    let tools = agentic_tool_definitions();
+    let mut messages: Vec<ChatMessage> = vec![ChatMessage::User(user_prompt.clone())];
+
+    // Accumulated results from add_chunks calls.
+    let mut accumulated: Vec<ChunkSelection> = Vec::new();
+    // Cache for sub-query results (query tool). Maps information_request → formatted chunks.
+    let mut query_cache: HashMap<String, Vec<MergeChunk>> = HashMap::new();
+    // Track all sub-query chunks so add_chunks can reference them by extended index.
+    let mut extended_chunks: Vec<MergeChunk> = chunks.to_vec();
+    let mut extended_numbered: Vec<Option<String>> = numbered.to_vec();
+
+    let mut raw_response_log = String::new();
+    // Set on every loop-exit path so the final decision is driven by structured
+    // state, never by scraping `raw_response_log`.
+    let mut exit = LoopExit::IterationCap;
+
+    // Turn budget: counts `query` calls. When the agent has issued this many
+    // queries, the loop stops (per product spec).
+    let query_budget = max_turns.max(1);
+    let mut query_calls: u32 = 0;
+
+    // Char budget: total emitted characters of added chunks. 0 disables. When
+    // the running total reaches this, the agent stops. Bounds output size and,
+    // together with the iteration + byte caps, keeps memory bounded.
+    let char_budget = max_chunk_chars as usize;
+    let mut accumulated_chars: usize = 0;
+
+    // Enforces the add_chunks → query → add_chunks cadence. After each
+    // successful add_chunks, this flips true; only a query call resets it.
+    // A second add_chunks while this is true is rejected with an error nudging
+    // the model toward query.
+    let mut awaiting_query = false;
+
+    // Hard safety ceiling on TOTAL iterations. Bounds an agent that neither
+    // finishes, queries to its budget, nor trips the char budget. Derived from
+    // the query budget — generous for interleaved query+add_chunks, capped.
+    let max_iterations = (query_budget as usize).saturating_mul(4).max(12);
+
+    for iteration in 0..max_iterations {
+        // Enforce byte cap
+        if estimate_history_bytes(&messages) > AGENTIC_HISTORY_BYTE_CAP {
+            tracing::info!(iteration, "agentic rerank: history byte cap reached, stopping");
+            exit = LoopExit::ByteCap;
+            break;
+        }
+
+        // Always force tool use — the agent must never respond with prose. It
+        // should only call add_chunks or query. The loop terminates via budget
+        // limits (char cap, query cap, iteration cap, byte cap), not via a text
+        // response from the model.
+        let force_tool_use = true;
+        let result = backend.next_turn(system, &messages, &tools, force_tool_use).await;
+
+        match result {
+            Err(e) => {
+                warn!(iteration, error = %e, "agentic rerank: LLM call failed");
+                raw_response_log.push_str(&format!("[Iter {iteration}] ERROR: {e}\n"));
+                exit = LoopExit::LlmError;
+                break;
+            }
+            Ok(ToolTurnResult::Text(text)) => {
+                raw_response_log.push_str(&format!("[Iter {iteration}] TEXT: {text}\n"));
+                exit = LoopExit::AgentDone;
+                break;
+            }
+            Ok(ToolTurnResult::ToolCalls(calls)) => {
+                raw_response_log.push_str(&format!("[Iter {iteration}] TOOL_CALLS: {}\n",
+                    calls.iter().map(|c| format!("{}({})", c.name, c.args)).collect::<Vec<_>>().join(", ")));
+
+                // Record model's tool calls in history
+                messages.push(ChatMessage::ModelToolCalls(calls.clone()));
+
+                let mut tool_results: Vec<ToolResult> = Vec::new();
+                // Mid-turn hard stop: set when the char budget is crossed BETWEEN
+                // add_chunks calls within a single response, so one response with
+                // many add_chunks cannot overshoot the budget unbounded.
+                let mut stop_mid_turn: Option<LoopExit> = None;
+
+                for call in &calls {
+                    match call.name.as_str() {
+                        "add_chunks" => {
+                            if awaiting_query {
+                                tool_results.push(ToolResult {
+                                    name: "add_chunks".to_owned(),
+                                    id: call.id.clone(),
+                                    content: "Error: add_chunks already called this phase. \
+                                        Call query to search for more context, or stop."
+                                        .to_owned(),
+                                });
+                                continue;
+                            }
+                            let (result_content, added_chars) = handle_add_chunks(
+                                &call.args,
+                                &extended_chunks,
+                                &extended_numbered,
+                                min_prune_lines,
+                                &mut accumulated,
+                                accumulated_chars,
+                                char_budget,
+                            );
+                            accumulated_chars = accumulated_chars.saturating_add(added_chars);
+                            awaiting_query = true;
+                            tool_results.push(ToolResult {
+                                name: "add_chunks".to_owned(),
+                                id: call.id.clone(),
+                                content: result_content,
+                            });
+                            // Hard stop the moment the budget is crossed — do NOT
+                            // process the rest of this response's calls.
+                            if char_budget > 0 && accumulated_chars >= char_budget {
+                                stop_mid_turn = Some(LoopExit::ChunkCharBudget);
+                                break;
+                            }
+                            // If query budget is already spent, no point continuing —
+                            // the model can't add_chunks again (awaiting_query) and
+                            // can't query (budget exhausted). End cleanly.
+                            if query_calls >= query_budget {
+                                stop_mid_turn = Some(LoopExit::QueryBudget);
+                                break;
+                            }
+                        }
+                        "query" => {
+                            awaiting_query = false;
+                            let info_req = call.args.get("information_request")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let result_content = run_query_tool(
+                                backend,
+                                info_req,
+                                &mut query_cache,
+                                &mut extended_chunks,
+                                &mut extended_numbered,
+                            ).await;
+                            // Only count against budget if the query actually ran
+                            // (not rejected as duplicate/empty).
+                            if !result_content.starts_with("Error:") {
+                                query_calls += 1;
+                            }
+                            tool_results.push(ToolResult {
+                                name: "query".to_owned(),
+                                id: call.id.clone(),
+                                content: result_content,
+                            });
+                        }
+                        other => {
+                            warn!(tool = %other, "agentic rerank: unknown tool call, skipping");
+                            tool_results.push(ToolResult {
+                                name: other.to_owned(),
+                                id: call.id.clone(),
+                                content: format!("Error: unknown tool '{other}'"),
+                            });
+                        }
+                    }
+                }
+
+                messages.push(ChatMessage::ToolResults(tool_results));
+
+                // Post-response budget decision (pure `boundary_exit`): a
+                // mid-turn char-budget stop (hard cap, `stop_mid_turn`) takes
+                // priority over the query-budget boundary count. Chunks committed
+                // before the stop are kept regardless of which fires.
+                if let Some(reason) = boundary_exit(stop_mid_turn, query_calls, query_budget) {
+                    tracing::info!(
+                        ?reason, accumulated_chars, char_budget, query_calls, query_budget,
+                        "agentic rerank: budget reached, stopping"
+                    );
+                    exit = reason;
+                    break;
+                }
+            }
+        }
+    }
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let raw_request_log = format!("[System]\n{system}\n\n[User]\n{user_prompt}");
+
+    // Build final output from the failure-semantics table (pure decision).
+    // The pool the agent could address: base candidates + any `query` results.
+    // `reranked_indices` (including the Fallback `all_indices`, since the first
+    // `n` entries ARE the base chunks) resolve against this uniformly.
+    let pool = ExtendedPool { chunks: extended_chunks, numbered: extended_numbered };
+
+    match decide_final_action(exit, accumulated.len()) {
+        FinalAction::EmptyRelevant => {
+            // Agent judged nothing relevant — empty result, not fallback.
+            return (
+                RerankOutput {
+                    reranked_indices: vec![],
+                    line_selections: vec![],
+                    raw_request: raw_request_log,
+                    raw_response: raw_response_log,
+                    elapsed_ms,
+                    fallback_used: false,
+                    skip_reason: None,
+                },
+                pool,
+            );
+        }
+        FinalAction::Fallback => {
+            let reason = match exit {
+                LoopExit::LlmError => "agentic LLM request failed with no chunks selected",
+                LoopExit::ByteCap => "agentic loop hit history byte cap with no chunks selected",
+                LoopExit::IterationCap => "agentic loop hit its iteration ceiling without selecting chunks",
+                LoopExit::QueryBudget => "agentic loop used its query budget without selecting chunks",
+                _ => "agentic loop ended without selecting chunks",
+            };
+            return (
+                RerankOutput {
+                    reranked_indices: all_indices,
+                    line_selections: vec![None; n],
+                    raw_request: raw_request_log,
+                    raw_response: raw_response_log,
+                    elapsed_ms,
+                    fallback_used: true,
+                    skip_reason: Some(reason.to_owned()),
+                },
+                pool,
+            );
+        }
+        FinalAction::UseAccumulated => { /* fall through to build below */ }
+    }
+
+    // Deduplicate: keep first occurrence of each chunk_index. Bound-check against
+    // the EXTENDED pool length so chunks pulled in by the `query` tool (index
+    // >= n) survive — bounding by `n` here would silently drop them.
+    let pool_len = pool.chunks.len();
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped: Vec<ChunkSelection> = Vec::new();
+    for (idx, lines) in accumulated {
+        if idx < pool_len && seen.insert(idx) {
+            deduped.push((idx, lines));
+        }
+    }
+
+    let reranked_indices: Vec<usize> = deduped.iter().map(|(idx, _)| *idx).collect();
+    let line_selections: Vec<Option<Vec<(u32, u32)>>> = deduped.into_iter().map(|(_, lines)| lines).collect();
+
+    (
+        RerankOutput {
+            reranked_indices,
+            line_selections,
+            raw_request: raw_request_log,
+            raw_response: raw_response_log,
+            elapsed_ms,
+            fallback_used: false,
+            skip_reason: None,
+        },
+        pool,
+    )
+}
+
+/// Handle one `add_chunks` call: add every chunk in the `chunks` array to the
+/// accumulator, in order. Returns `(summary, added_chars)` where `added_chars`
+/// is the total emitted character count of the chunks committed by THIS call —
+/// the same content engine.rs step-7 will emit, so the loop's char budget
+/// measures real output size. `numbered` is aligned 1:1 with `chunks`.
+fn handle_add_chunks(
+    args: &serde_json::Value,
+    chunks: &[MergeChunk],
+    numbered: &[Option<String>],
+    min_prune_lines: u32,
+    accumulated: &mut Vec<ChunkSelection>,
+    accumulated_chars: usize,
+    char_budget: usize,
+) -> (String, usize) {
+    let Some(arr) = args.get("chunks").and_then(|v| v.as_array()) else {
+        return ("Error: `chunks` is required and must be an array of {chunk_index, lines?} objects".to_owned(), 0);
+    };
+    if arr.is_empty() {
+        return ("Error: `chunks` array is empty — include at least one {chunk_index} object".to_owned(), 0);
+    }
+
+    let mut lines_out: Vec<String> = Vec::with_capacity(arr.len());
+    let mut added_chars = 0usize;
+    for item in arr {
+        let (line, chars) = add_one_chunk(item, chunks, numbered, min_prune_lines, accumulated);
+        lines_out.push(line);
+        added_chars = added_chars.saturating_add(chars);
+    }
+
+    let total_chars = accumulated_chars.saturating_add(added_chars);
+    let remaining = if char_budget > 0 { char_budget.saturating_sub(total_chars) } else { 0 };
+    lines_out.push(format!(
+        "--- {}/{} chunks selected, {total_chars}/{char_budget} chars used, {remaining} remaining. \
+         Selection for this set is FINAL. Call query with a NEW search string for more context, or stop.",
+        accumulated.len(), chunks.len()
+    ));
+    (lines_out.join("\n"), added_chars)
+}
+
+/// Validate and accumulate a single `{chunk_index, lines?}` entry. Returns
+/// `(status_line, emitted_chars)`. `emitted_chars` is 0 for an error entry, and
+/// otherwise the character count of the content engine.rs will emit for this
+/// chunk (sliced ranges, or whole numbered text, or stored content fallback).
+fn add_one_chunk(
+    item: &serde_json::Value,
+    chunks: &[MergeChunk],
+    numbered: &[Option<String>],
+    min_prune_lines: u32,
+    accumulated: &mut Vec<ChunkSelection>,
+) -> (String, usize) {
+    let idx = match item.get("chunk_index").and_then(|v| v.as_u64()) {
+        Some(i) => i as usize,
+        None => return ("Error: chunk_index is required and must be an integer".to_owned(), 0),
+    };
+
+    if idx >= chunks.len() {
+        return (format!("Error: chunk_index {idx} out of range (0..{})", chunks.len()), 0);
+    }
+
+    if accumulated.iter().any(|(i, _)| *i == idx) {
+        return (format!("Skipped: chunk {idx} already added"), 0);
+    }
+
+    let chunk = &chunks[idx];
+    let raw_lines = item.get("lines").and_then(|v| v.as_array());
+
+    let selection = match raw_lines {
+        None => None,
+        Some(arr) if arr.is_empty() => None,
+        Some(arr) => {
+            if chunk.line_end.saturating_sub(chunk.line_start) < min_prune_lines {
+                None
+            } else {
+                sanitize_ranges(arr, chunk.line_start, chunk.line_end)
+            }
+        }
+    };
+
+    let emitted = emitted_chars(chunk, numbered.get(idx).and_then(|n| n.as_deref()), &selection);
+    accumulated.push((idx, selection));
+    (
+        format!("OK: added chunk {idx} ({}:{}-{})", chunk.file, chunk.line_start, chunk.line_end),
+        emitted,
+    )
+}
+
+/// Character count of the content engine.rs step-7 will emit for one selected
+/// chunk. Mirrors that formatting exactly: per-range slices when a line
+/// selection is present and the numbered text is readable; the whole numbered
+/// text otherwise; the stored content as the final fallback.
+fn emitted_chars(chunk: &MergeChunk, numbered_text: Option<&str>, selection: &Option<Vec<(u32, u32)>>) -> usize {
+    match (numbered_text, selection) {
+        (Some(text), Some(ranges)) if !ranges.is_empty() => ranges
+            .iter()
+            .map(|&(s, e)| slice_numbered(text, chunk.line_start, s, e).len())
+            .sum(),
+        (Some(text), _) => text.len(),
+        (None, _) => chunk.content.len(),
+    }
+}
+
+/// Handle one `query` tool call: cache lookup → `backend.sub_query` → extend
+/// the addressable chunk pool → format for the agent. Generic over the backend
+/// so tests drive it with mock retrieval.
+async fn run_query_tool<B: AgenticBackend>(
+    backend: &B,
+    information_request: &str,
+    query_cache: &mut HashMap<String, Vec<MergeChunk>>,
+    extended_chunks: &mut Vec<MergeChunk>,
+    extended_numbered: &mut Vec<Option<String>>,
+) -> String {
+    if information_request.is_empty() {
+        return "Error: information_request is required".to_owned();
+    }
+
+    // Reject duplicate queries — force the model to vary its search terms.
+    if query_cache.contains_key(information_request) {
+        return "Error: this exact query was already used. Try a different information_request.".to_owned();
+    }
+
+    match backend.sub_query(information_request).await {
+        Err(e) => format!("Error: query failed: {e}"),
+        Ok(results) => {
+            if results.is_empty() {
+                return "No results found for this query.".to_owned();
+            }
+
+            let start_idx = extended_chunks.len();
+            // Add results to extended pool so add_chunk can reference them
+            for chunk in &results {
+                let numbered_text = read_lines_from_fs(&chunk.file, chunk.line_start, chunk.line_end).ok();
+                extended_numbered.push(numbered_text);
+                extended_chunks.push(chunk.clone());
+            }
+
+            let response = format_sub_query_results(&results, start_idx);
+            query_cache.insert(information_request.to_owned(), results);
+            response
+        }
+    }
+}
+
+fn format_sub_query_results(results: &[MergeChunk], start_idx: usize) -> String {
+    let mut output = format!("Found {} results (chunk indices {}-{}):\n\n",
+        results.len(), start_idx, start_idx + results.len() - 1);
+
+    for (i, chunk) in results.iter().enumerate() {
+        let idx = start_idx + i;
+        let symbol_display = chunk.symbol.as_deref().unwrap_or("no symbol");
+        let content = truncate_content(&chunk.content, 60);
+        output.push_str(&format!(
+            "[{idx}] score={:.2} | {}:{}-{} ({symbol_display})\n{content}\n---\n",
+            chunk.score, chunk.file, chunk.line_start, chunk.line_end
+        ));
+    }
+    output
 }
 
 fn parse_rerank_response(
@@ -608,5 +1378,808 @@ mod tests {
         assert!(!out.fallback_used);
         assert_eq!(out.reranked_indices, vec![1]);
         assert_eq!(out.line_selections, vec![None]);
+    }
+
+    // ── Agentic rerank helper tests ─────────────────────────────────────────
+
+    #[test]
+    fn add_chunks_valid_full() {
+        let chunks = vec![chunk(100, 200), chunk(1, 10)];
+        let numbered = vec![None, None];
+        let mut accumulated = Vec::new();
+        let (result, chars) = handle_add_chunks(
+            &json!({"chunks": [{"chunk_index": 0}]}),
+            &chunks,
+            &numbered,
+            16,
+            &mut accumulated,
+            0,
+            50_000,
+        );
+        assert!(result.starts_with("OK:"));
+        assert_eq!(accumulated.len(), 1);
+        assert_eq!(accumulated[0], (0, None));
+        // No numbered text → emitted chars = stored content len ("stored" = 6).
+        assert_eq!(chars, "stored".len());
+    }
+
+    #[test]
+    fn add_chunks_multiple_at_once() {
+        // The core new behavior: one call adds many chunks, in order.
+        let chunks = vec![chunk(100, 200), chunk(1, 10), chunk(300, 400)];
+        let numbered = vec![None, None, None];
+        let mut accumulated = Vec::new();
+        let (result, _chars) = handle_add_chunks(
+            &json!({"chunks": [
+                {"chunk_index": 2},
+                {"chunk_index": 0, "lines": [[110, 120]]},
+                {"chunk_index": 1}
+            ]}),
+            &chunks,
+            &numbered,
+            16,
+            &mut accumulated,
+            0,
+            50_000,
+        );
+        // Three OK lines, one per chunk.
+        assert_eq!(result.lines().filter(|l| l.starts_with("OK:")).count(), 3);
+        assert_eq!(accumulated.len(), 3);
+        assert_eq!(accumulated[0], (2, None));
+        assert_eq!(accumulated[1], (0, Some(vec![(108, 122)]))); // big chunk → ranges kept
+        assert_eq!(accumulated[2], (1, None));                    // small chunk → whole
+    }
+
+    #[test]
+    fn add_chunks_chars_count_uses_sliced_ranges() {
+        // With numbered text present and a line selection, emitted chars must be
+        // the SLICED length (what engine.rs emits), not the whole chunk.
+        let chunks = vec![chunk(100, 200)]; // span 100 ≥ min_prune_lines
+        // 5 numbered lines of the chunk; selection [110,120] pads→[108,122] then
+        // slices within this text. Build a realistic numbered block.
+        let numbered_text: String = (100..=200)
+            .map(|ln| format!("{ln}: code line {ln}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let numbered = vec![Some(numbered_text.clone())];
+        let mut accumulated = Vec::new();
+        let (_result, chars) = handle_add_chunks(
+            &json!({"chunks": [{"chunk_index": 0, "lines": [[110, 120]]}]}),
+            &chunks,
+            &numbered,
+            16,
+            &mut accumulated,
+            0,
+            50_000,
+        );
+        // Expected = len of the sliced range [108,122] (pad ±2), computed via the
+        // same slice_numbered the engine uses — so the budget measures real output.
+        let expected = slice_numbered(&numbered_text, 100, 108, 122).len();
+        assert_eq!(chars, expected);
+        assert!(chars < numbered_text.len(), "sliced is smaller than whole chunk");
+    }
+
+    #[test]
+    fn add_chunks_with_lines() {
+        let chunks = vec![chunk(100, 200)];
+        let numbered = vec![None];
+        let mut accumulated = Vec::new();
+        let (result, _chars) = handle_add_chunks(
+            &json!({"chunks": [{"chunk_index": 0, "lines": [[110, 120]]}]}),
+            &chunks,
+            &numbered,
+            16,
+            &mut accumulated,
+            0,
+            50_000,
+        );
+        assert!(result.starts_with("OK:"));
+        assert_eq!(accumulated.len(), 1);
+        assert_eq!(accumulated[0].0, 0);
+        assert_eq!(accumulated[0].1, Some(vec![(108, 122)]));
+    }
+
+    #[test]
+    fn add_chunks_small_chunk_ignores_lines() {
+        let chunks = vec![chunk(1, 10)]; // span 9 < min_prune_lines 16
+        let numbered = vec![None];
+        let mut accumulated = Vec::new();
+        handle_add_chunks(
+            &json!({"chunks": [{"chunk_index": 0, "lines": [[3, 5]]}]}),
+            &chunks,
+            &numbered,
+            16,
+            &mut accumulated,
+            0,
+            50_000,
+        );
+        assert_eq!(accumulated[0].1, None);
+    }
+
+    #[test]
+    fn add_chunks_out_of_range_entry_errors_but_others_kept() {
+        // A bad index in the array is reported but does not abort the whole call.
+        let chunks = vec![chunk(1, 10)];
+        let numbered = vec![None];
+        let mut accumulated = Vec::new();
+        let (result, _chars) = handle_add_chunks(
+            &json!({"chunks": [{"chunk_index": 5}, {"chunk_index": 0}]}),
+            &chunks,
+            &numbered,
+            16,
+            &mut accumulated,
+            0,
+            50_000,
+        );
+        assert!(result.contains("Error:"), "bad index reported");
+        assert!(result.contains("OK:"), "valid index still added");
+        assert_eq!(accumulated, vec![(0, None)]);
+    }
+
+    #[test]
+    fn add_chunks_missing_chunks_array_errors() {
+        let chunks = vec![chunk(1, 10)];
+        let numbered = vec![None];
+        let mut accumulated = Vec::new();
+        let (result, chars) = handle_add_chunks(
+            &json!({"chunk_index": 0}), // wrong shape: no `chunks` array
+            &chunks,
+            &numbered,
+            16,
+            &mut accumulated,
+            0,
+            50_000,
+        );
+        assert!(result.starts_with("Error:"));
+        assert!(accumulated.is_empty());
+        assert_eq!(chars, 0, "error path adds no chars");
+    }
+
+    #[test]
+    fn add_chunks_empty_array_errors() {
+        let chunks = vec![chunk(1, 10)];
+        let numbered = vec![None];
+        let mut accumulated = Vec::new();
+        let (result, _chars) = handle_add_chunks(
+            &json!({"chunks": []}),
+            &chunks,
+            &numbered,
+            16,
+            &mut accumulated,
+            0,
+            50_000,
+        );
+        assert!(result.starts_with("Error:"));
+        assert!(accumulated.is_empty());
+    }
+
+    #[test]
+    fn add_chunks_missing_index_in_entry() {
+        let chunks = vec![chunk(1, 10)];
+        let numbered = vec![None];
+        let mut accumulated = Vec::new();
+        let (result, _chars) = handle_add_chunks(
+            &json!({"chunks": [{"lines": [[1, 2]]}]}),
+            &chunks,
+            &numbered,
+            16,
+            &mut accumulated,
+            0,
+            50_000,
+        );
+        assert!(result.contains("Error:"));
+        assert!(accumulated.is_empty());
+    }
+
+    #[test]
+    fn estimate_history_bytes_basic() {
+        let messages = vec![
+            ChatMessage::User("hello world".to_owned()),
+            ChatMessage::ToolResults(vec![ToolResult {
+                name: "add_chunk".to_owned(),
+                id: None,
+                content: "OK: added chunk 0".to_owned(),
+            }]),
+        ];
+        let bytes = estimate_history_bytes(&messages);
+        assert!(bytes > 20);
+        assert!(bytes < 200);
+    }
+
+    #[test]
+    fn agentic_tool_definitions_are_valid() {
+        let tools = agentic_tool_definitions();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "add_chunks");
+        assert_eq!(tools[1].name, "query");
+        // Verify parameters are valid JSON objects
+        assert!(tools[0].parameters.is_object());
+        assert!(tools[1].parameters.is_object());
+    }
+
+    // ── Failure-semantics matrix (decide_final_action) ──────────────────────
+    // Every row of the committed table is asserted here. This is the contract
+    // that distinguishes empty-relevant from fallback — the silent-break risk.
+
+    #[test]
+    fn matrix_agent_done_zero_is_empty_relevant_not_fallback() {
+        // Agent finished with text and selected nothing → honor as empty result.
+        assert_eq!(decide_final_action(LoopExit::AgentDone, 0), FinalAction::EmptyRelevant);
+    }
+
+    #[test]
+    fn matrix_agent_done_nonzero_uses_accumulated() {
+        assert_eq!(decide_final_action(LoopExit::AgentDone, 3), FinalAction::UseAccumulated);
+    }
+
+    #[test]
+    fn matrix_llm_error_zero_is_fallback() {
+        // HTTP error with nothing committed → fallback to original order.
+        assert_eq!(decide_final_action(LoopExit::LlmError, 0), FinalAction::Fallback);
+    }
+
+    #[test]
+    fn matrix_llm_error_nonzero_keeps_accumulated() {
+        // HTTP error AFTER the agent committed chunks → keep them (break-and-keep).
+        assert_eq!(decide_final_action(LoopExit::LlmError, 2), FinalAction::UseAccumulated);
+    }
+
+    #[test]
+    fn matrix_query_budget_nonzero_uses_accumulated() {
+        // Spent the query budget but had committed chunks → keep them.
+        assert_eq!(decide_final_action(LoopExit::QueryBudget, 5), FinalAction::UseAccumulated);
+    }
+
+    #[test]
+    fn matrix_query_budget_zero_is_fallback() {
+        // Used all queries but never added a chunk → fallback to original order.
+        assert_eq!(decide_final_action(LoopExit::QueryBudget, 0), FinalAction::Fallback);
+    }
+
+    #[test]
+    fn matrix_chunk_char_budget_nonzero_uses_accumulated() {
+        // Hit the char budget → by construction chunks were committed → keep them.
+        assert_eq!(decide_final_action(LoopExit::ChunkCharBudget, 4), FinalAction::UseAccumulated);
+    }
+
+    #[test]
+    fn matrix_chunk_char_budget_zero_is_fallback() {
+        // Unreachable in the live loop (chars only grow when add_chunks commits),
+        // but the table is total — fallback is the safe choice.
+        assert_eq!(decide_final_action(LoopExit::ChunkCharBudget, 0), FinalAction::Fallback);
+    }
+
+    #[test]
+    fn matrix_iteration_cap_zero_is_fallback() {
+        assert_eq!(decide_final_action(LoopExit::IterationCap, 0), FinalAction::Fallback);
+    }
+
+    #[test]
+    fn matrix_iteration_cap_nonzero_uses_accumulated() {
+        assert_eq!(decide_final_action(LoopExit::IterationCap, 2), FinalAction::UseAccumulated);
+    }
+
+    #[test]
+    fn matrix_byte_cap_zero_is_fallback() {
+        assert_eq!(decide_final_action(LoopExit::ByteCap, 0), FinalAction::Fallback);
+    }
+
+    #[test]
+    fn matrix_byte_cap_nonzero_uses_accumulated() {
+        assert_eq!(decide_final_action(LoopExit::ByteCap, 1), FinalAction::UseAccumulated);
+    }
+
+    #[test]
+    fn matrix_empty_relevant_is_distinct_from_fallback() {
+        // The critical distinction: AgentDone/0 and IterationCap/0 both have zero
+        // accumulated chunks but MUST produce different actions, or the
+        // empty-vs-fallback contract collapses silently.
+        let agent_done = decide_final_action(LoopExit::AgentDone, 0);
+        let iter_cap = decide_final_action(LoopExit::IterationCap, 0);
+        assert_ne!(agent_done, iter_cap);
+        assert_eq!(agent_done, FinalAction::EmptyRelevant);
+        assert_eq!(iter_cap, FinalAction::Fallback);
+    }
+
+    // ── End-to-end agentic loop via a scripted mock backend ─────────────────
+    // These drive the REAL `run_agentic_loop` (same code path as production),
+    // proving each failure-matrix row maps to the correct observable
+    // RerankOutput. No parallel copy of the field-assembly logic exists.
+
+    use std::cell::RefCell;
+    use crate::llm::ToolCall;
+
+    /// One scripted LLM turn outcome the mock will return, in order.
+    enum MockTurn {
+        /// Emit tool calls (e.g. add_chunk / query).
+        Calls(Vec<ToolCall>),
+        /// Emit a text response (agent signals done).
+        Text(String),
+        /// Simulate an HTTP/transport error on this turn.
+        Err(String),
+    }
+
+    /// Scripted backend: pops one `MockTurn` per `next_turn` call. `sub_query`
+    /// returns a fixed canned chunk set so the `query` tool path is exercised.
+    struct MockBackend {
+        turns: RefCell<std::collections::VecDeque<MockTurn>>,
+        sub_query_chunks: Vec<MergeChunk>,
+    }
+
+    impl MockBackend {
+        fn new(turns: Vec<MockTurn>) -> Self {
+            Self { turns: RefCell::new(turns.into()), sub_query_chunks: vec![] }
+        }
+        fn with_sub_query(turns: Vec<MockTurn>, sub: Vec<MergeChunk>) -> Self {
+            Self { turns: RefCell::new(turns.into()), sub_query_chunks: sub }
+        }
+    }
+
+    impl AgenticBackend for MockBackend {
+        fn next_turn(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDef],
+            _force_tool_use: bool,
+        ) -> impl std::future::Future<Output = anyhow::Result<ToolTurnResult>> + Send {
+            // Pop synchronously (no guard held across the returned future's await).
+            let next = self.turns.borrow_mut().pop_front();
+            async move {
+                match next {
+                    Some(MockTurn::Calls(c)) => Ok(ToolTurnResult::ToolCalls(c)),
+                    Some(MockTurn::Text(t)) => Ok(ToolTurnResult::Text(t)),
+                    Some(MockTurn::Err(e)) => Err(anyhow::anyhow!(e)),
+                    // Script exhausted unexpectedly → behave like an error.
+                    None => Err(anyhow::anyhow!("mock: no more scripted turns")),
+                }
+            }
+        }
+
+        fn sub_query(
+            &self,
+            _information_request: &str,
+        ) -> impl std::future::Future<Output = anyhow::Result<Vec<MergeChunk>>> + Send {
+            let chunks = self.sub_query_chunks.clone();
+            async move { Ok(chunks) }
+        }
+    }
+
+    /// An `add_chunks` call carrying a single chunk (one turn, one chunk).
+    fn add_chunk_call(idx: usize) -> ToolCall {
+        ToolCall {
+            name: "add_chunks".to_owned(),
+            id: Some(format!("c{idx}")),
+            args: json!({ "chunks": [{ "chunk_index": idx }] }),
+            ..Default::default()
+        }
+    }
+
+    /// An `add_chunks` call carrying a single chunk with line ranges.
+    fn add_chunk_call_lines(idx: usize, ranges: serde_json::Value) -> ToolCall {
+        ToolCall {
+            name: "add_chunks".to_owned(),
+            id: Some(format!("c{idx}")),
+            args: json!({ "chunks": [{ "chunk_index": idx, "lines": ranges }] }),
+            ..Default::default()
+        }
+    }
+
+    /// An `add_chunks` call carrying MANY chunks at once (one turn, many chunks).
+    fn add_chunks_call(indices: &[usize]) -> ToolCall {
+        let chunks: Vec<_> = indices.iter().map(|i| json!({ "chunk_index": i })).collect();
+        ToolCall {
+            name: "add_chunks".to_owned(),
+            id: Some("batch".to_owned()),
+            args: json!({ "chunks": chunks }),
+            ..Default::default()
+        }
+    }
+
+    fn run_loop(backend: &MockBackend, n: usize, max_turns: u32) -> (RerankOutput, ExtendedPool) {
+        // char budget disabled (0) for query-budget / general loop tests.
+        run_loop_full(backend, n, max_turns, 0)
+    }
+
+    /// Like `run_loop` but with an explicit char budget (for char-budget tests).
+    fn run_loop_full(backend: &MockBackend, n: usize, max_turns: u32, max_chunk_chars: u32) -> (RerankOutput, ExtendedPool) {
+        // Base chunks get DISTINCT line ranges (100+i .. 110+i) so a test can
+        // tell a base chunk from a sub-query chunk by its coordinates — this is
+        // what proves base indices resolve to base chunks, not shifted ones.
+        let chunks: Vec<MergeChunk> = (0..n).map(|i| chunk(100 + i as u32, 110 + i as u32)).collect();
+        let numbered = vec![None; n];
+        let caller_stats = vec![None; n];
+        // Drive the REAL loop on the current-thread runtime.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(run_agentic_loop(backend, "q", &chunks, &numbered, &caller_stats, 16, max_turns, max_chunk_chars))
+    }
+
+    /// Mirror of engine.rs step-7 index resolution: for each reranked index,
+    /// resolve against the pool (when present) exactly as production does —
+    /// `res_chunks.get(idx)` with `else continue`. Returns the (line_start,
+    /// line_end) of each successfully-resolved chunk, in output order. If a base
+    /// index failed to resolve (the silent-drop bug), it would be MISSING here.
+    fn resolve_like_engine(out: &RerankOutput, pool: &ExtendedPool) -> Vec<(u32, u32)> {
+        let mut resolved = Vec::new();
+        for &idx in &out.reranked_indices {
+            let Some(chunk) = pool.chunks.get(idx) else { continue };
+            resolved.push((chunk.line_start, chunk.line_end));
+        }
+        resolved
+    }
+
+    #[test]
+    fn loop_agent_done_zero_chunks_is_empty_not_fallback() {
+        // Turn 0: agent immediately returns text, selecting nothing.
+        let backend = MockBackend::new(vec![MockTurn::Text("nothing relevant".into())]);
+        let (out, _pool) = run_loop(&backend, 4, 3);
+        assert!(out.reranked_indices.is_empty(), "empty result set");
+        assert!(!out.fallback_used, "must NOT be flagged as fallback");
+        assert!(out.skip_reason.is_none());
+    }
+
+    #[test]
+    fn loop_iteration_cap_zero_chunks_is_fallback_all_indices() {
+        // Every iteration emits an unknown tool (never add_chunks, never finishes,
+        // never queries) → hits the hard iteration ceiling with zero accumulated.
+        // Script enough no-ops to exceed max_iterations = max(budget*4, 12).
+        let noop = || MockTurn::Calls(vec![ToolCall {
+            name: "noop".to_owned(), id: Some("x".into()), args: json!({}),
+            ..Default::default()
+        }]);
+        let backend = MockBackend::new((0..20).map(|_| noop()).collect());
+        let (out, _pool) = run_loop(&backend, 4, 2);
+        assert_eq!(out.reranked_indices, vec![0, 1, 2, 3], "fallback = original order");
+        assert!(out.fallback_used, "must be flagged as fallback");
+        assert!(out.skip_reason.as_deref().unwrap().contains("iteration ceiling"));
+    }
+
+    #[test]
+    fn loop_llm_error_with_accumulated_keeps_chunks() {
+        // Turn 0: add_chunks([2, 0]) in one call. Turn 1: HTTP error.
+        // Expect [2, 0] kept, NOT fallback.
+        let backend = MockBackend::new(vec![
+            MockTurn::Calls(vec![add_chunks_call(&[2, 0])]),
+            MockTurn::Err("503 upstream".into()),
+        ]);
+        let (out, _pool) = run_loop(&backend, 4, 5);
+        assert_eq!(out.reranked_indices, vec![2, 0], "accumulated order preserved");
+        assert!(!out.fallback_used, "accumulated chunks are not a fallback");
+    }
+
+    #[test]
+    fn loop_llm_error_zero_chunks_is_fallback() {
+        // Turn 0: immediate HTTP error before any add_chunk.
+        let backend = MockBackend::new(vec![MockTurn::Err("connection reset".into())]);
+        let (out, _pool) = run_loop(&backend, 3, 5);
+        assert_eq!(out.reranked_indices, vec![0, 1, 2]);
+        assert!(out.fallback_used);
+        assert!(out.skip_reason.as_deref().unwrap().contains("failed"));
+    }
+
+    #[test]
+    fn loop_agent_done_with_accumulated_uses_them() {
+        // Turn 0: add_chunks([1, 0]) in one call. Turn 1: text done.
+        let backend = MockBackend::new(vec![
+            MockTurn::Calls(vec![add_chunks_call(&[1, 0])]),
+            MockTurn::Text("done".into()),
+        ]);
+        let (out, _pool) = run_loop(&backend, 3, 5);
+        assert_eq!(out.reranked_indices, vec![1, 0], "selection order preserved");
+        assert!(!out.fallback_used);
+        // chunk(1,10) span 9 < min_prune_lines 16 → both kept whole.
+        assert_eq!(out.line_selections, vec![None, None]);
+    }
+
+    #[test]
+    fn loop_dedups_repeated_add_chunk() {
+        // Agent adds chunks [1, 0] including a duplicate of 1 in the same call.
+        // Dedup keeps first occurrence of each index.
+        let backend = MockBackend::new(vec![
+            MockTurn::Calls(vec![ToolCall {
+                name: "add_chunks".to_owned(),
+                id: Some("c0".into()),
+                args: json!({ "chunks": [
+                    { "chunk_index": 1 },
+                    { "chunk_index": 1 },
+                    { "chunk_index": 0 }
+                ]}),
+                ..Default::default()
+            }]),
+            MockTurn::Text("done".into()),
+        ]);
+        let (out, _pool) = run_loop(&backend, 3, 5);
+        assert_eq!(out.reranked_indices, vec![1, 0], "dedup keeps first occurrence");
+        assert!(!out.fallback_used);
+    }
+
+    #[test]
+    fn loop_query_tool_then_add_extended_chunk() {
+        // Turn 0: agent calls query → mock returns 1 extra chunk (index n=2).
+        // Turn 1: agent add_chunk(2) (the new extended chunk). Turn 2: done.
+        // Proves the query path extends the addressable pool and add_chunk can
+        // reference sub-query results.
+        let sub = vec![chunk(50, 60)];
+        let backend = MockBackend::with_sub_query(
+            vec![
+                MockTurn::Calls(vec![ToolCall {
+                    name: "query".to_owned(),
+                    id: Some("q0".into()),
+                    args: json!({ "information_request": "more context" }),
+                    ..Default::default()
+                }]),
+                MockTurn::Calls(vec![add_chunk_call(2)]), // index 2 = first sub-query chunk
+                MockTurn::Text("done".into()),
+            ],
+            sub,
+        );
+        // n=2 base chunks; sub-query adds index 2.
+        let (out, pool) = run_loop(&backend, 2, 5);
+        assert_eq!(out.reranked_indices, vec![2], "added the extended sub-query chunk");
+        assert!(!out.fallback_used);
+        // The extended pool must carry the sub-query chunk at index 2, and the
+        // engine resolves the reranked index against THIS pool (not base merged).
+        assert_eq!(pool.chunks.len(), 3, "base 2 + 1 sub-query chunk");
+        assert_eq!(pool.chunks[2].line_start, 50, "index 2 is the sub-query chunk");
+        assert_eq!(pool.chunks[2].line_end, 60);
+        assert!(pool.chunks.get(out.reranked_indices[0]).is_some(),
+            "reranked index resolves within the extended pool");
+    }
+
+    #[test]
+    fn loop_fallback_after_query_resolves_base_indices_not_subquery() {
+        // The trap: a `query` runs (appending sub-query chunks to the pool),
+        // THEN the loop falls back (LLM error, zero accumulated). Fallback emits
+        // base indices 0..base_n — they MUST resolve to the base chunks, not be
+        // shifted onto the appended sub-query chunks, and must NOT silently drop.
+        let sub = vec![chunk(50, 60), chunk(70, 80)]; // distinct from base 100+ ranges
+        let backend = MockBackend::with_sub_query(
+            vec![
+                MockTurn::Calls(vec![ToolCall {
+                    name: "query".to_owned(),
+                    id: Some("q0".into()),
+                    args: json!({ "information_request": "expand" }),
+                    ..Default::default()
+                }]),
+                MockTurn::Err("503 after query".into()), // fallback with 0 accumulated
+            ],
+            sub,
+        );
+        // 3 base chunks (ranges 100-110, 101-111, 102-112) + 2 sub-query appended.
+        let (out, pool) = run_loop(&backend, 3, 5);
+
+        assert!(out.fallback_used, "must be a fallback");
+        assert_eq!(out.reranked_indices, vec![0, 1, 2], "fallback = base order 0..base_n");
+        assert_eq!(pool.chunks.len(), 5, "pool = 3 base + 2 sub-query");
+
+        // Resolve exactly as engine.rs does. All three base indices must resolve
+        // (no silent drop) AND land on the BASE chunks (100-range), proving the
+        // appended sub-query chunks did not shift base positions.
+        let resolved = resolve_like_engine(&out, &pool);
+        assert_eq!(
+            resolved,
+            vec![(100, 110), (101, 111), (102, 112)],
+            "base indices resolve to base chunks, not the appended sub-query chunks"
+        );
+        assert_eq!(resolved.len(), 3, "no base index silently dropped via else-continue");
+    }
+
+    #[test]
+    fn loop_empty_relevant_with_populated_pool_resolves_to_nothing() {
+        // EmptyRelevant: agent ran a query (pool populated) then finished with
+        // text and zero selections. reranked_indices is empty, so engine.rs
+        // emits no blocks — confirm a Some(pool) with chunks doesn't choke and
+        // produces an empty result (not the base chunks, not a panic).
+        let sub = vec![chunk(50, 60)];
+        let backend = MockBackend::with_sub_query(
+            vec![
+                MockTurn::Calls(vec![ToolCall {
+                    name: "query".to_owned(),
+                    id: Some("q0".into()),
+                    args: json!({ "information_request": "expand" }),
+                    ..Default::default()
+                }]),
+                MockTurn::Text("nothing relevant after all".into()),
+            ],
+            sub,
+        );
+        let (out, pool) = run_loop(&backend, 3, 5);
+
+        assert!(!out.fallback_used, "EmptyRelevant is NOT a fallback");
+        assert!(out.reranked_indices.is_empty(), "agent selected nothing");
+        assert_eq!(pool.chunks.len(), 4, "pool still populated: 3 base + 1 sub-query");
+        // Engine-style resolution over zero indices yields zero blocks — no panic
+        // on the non-empty pool.
+        assert!(resolve_like_engine(&out, &pool).is_empty());
+    }
+
+    // ── Turn-budget semantics (turns = query calls) ─────────────────────────
+
+    #[test]
+    fn budget_counts_query_calls_and_stops() {
+        // max_turns = 2 (query budget). Two query turns with different strings
+        // spend the budget; the loop stops at the response boundary.
+        let sub = vec![chunk(50, 60)];
+        let backend = MockBackend::with_sub_query(
+            vec![
+                MockTurn::Calls(vec![ToolCall {
+                    name: "query".to_owned(), id: Some("q1".into()),
+                    args: json!({ "information_request": "first query" }),
+                    ..Default::default()
+                }]),                                            // query 1/2
+                MockTurn::Calls(vec![ToolCall {
+                    name: "query".to_owned(), id: Some("q2".into()),
+                    args: json!({ "information_request": "second query" }),
+                    ..Default::default()
+                }]),                                            // query 2/2 → STOP after this turn
+                MockTurn::Calls(vec![add_chunk_call(0)]),       // must NOT be reached
+            ],
+            sub,
+        );
+        // 0 chunks committed, exited via QueryBudget → fallback to original order.
+        let (out, _pool) = run_loop(&backend, 2, 2);
+        assert!(out.fallback_used, "query budget hit with 0 chunks → fallback");
+        assert_eq!(out.reranked_indices, vec![0, 1], "fallback = original order");
+        assert!(out.skip_reason.as_deref().unwrap().contains("query budget"));
+    }
+
+    #[test]
+    fn budget_query_then_add_keeps_chunks() {
+        // max_turns = 1. Turn 0: one query (spends the budget) AND, in the SAME
+        // model turn, an add_chunks. The boundary check keeps the committed chunk
+        // and exits via QueryBudget with accumulated >= 1 → UseAccumulated.
+        let sub = vec![chunk(50, 60)];
+        let backend = MockBackend::with_sub_query(
+            vec![
+                MockTurn::Calls(vec![
+                    ToolCall { name: "query".to_owned(), id: Some("q".into()),
+                               args: json!({ "information_request": "x" }), ..Default::default() },
+                    add_chunk_call(0),
+                ]),
+                MockTurn::Text("done".into()), // not reached (budget hit)
+            ],
+            sub,
+        );
+        let (out, _pool) = run_loop(&backend, 2, 1);
+        assert_eq!(out.reranked_indices, vec![0], "committed chunk kept despite query budget");
+        assert!(!out.fallback_used);
+    }
+
+    #[test]
+    fn budget_add_chunks_calls_do_not_consume_query_budget() {
+        // max_turns = 1 (query budget). The agent adds all chunks in one call
+        // then finishes with text. Proves add_chunks does not decrement the budget.
+        let backend = MockBackend::new(vec![
+            MockTurn::Calls(vec![add_chunks_call(&[0, 1, 2])]),
+            MockTurn::Text("done".into()),
+        ]);
+        let (out, _pool) = run_loop(&backend, 3, 1);
+        assert_eq!(out.reranked_indices, vec![0, 1, 2], "all add_chunks committed, query budget untouched");
+        assert!(!out.fallback_used);
+    }
+
+    #[test]
+    fn budget_zero_max_turns_clamped_to_one() {
+        // max_turns = 0 must clamp to 1 (query_budget.max(1)). One query is
+        // allowed, then the budget stops the loop.
+        let sub = vec![chunk(50, 60)];
+        let backend = MockBackend::with_sub_query(
+            vec![
+                MockTurn::Calls(vec![
+                    ToolCall { name: "query".to_owned(), id: Some("q".into()),
+                               args: json!({ "information_request": "x" }), ..Default::default() },
+                    add_chunk_call(0),
+                ]),
+                MockTurn::Calls(vec![add_chunk_call(1)]), // not reached
+            ],
+            sub,
+        );
+        let (out, _pool) = run_loop(&backend, 2, 0);
+        assert_eq!(out.reranked_indices, vec![0], "clamped query budget of 1 allows one query turn");
+        assert!(!out.fallback_used);
+    }
+
+    // ── Char-budget semantics (stop when added chunk content reaches cap) ────
+
+    #[test]
+    fn char_budget_stops_after_threshold() {
+        // Base chunks have stored content "stored" (6 chars) and no numbered text,
+        // so each added chunk emits 6 chars. Budget = 7: one add_chunks([0, 1])
+        // adds both (6 + 6 = 12 >= 7) → loop stops. Chunk 2 is never reached.
+        let backend = MockBackend::new(vec![
+            MockTurn::Calls(vec![add_chunks_call(&[0, 1])]), // total 12 (>= 7) → STOP
+            MockTurn::Calls(vec![add_chunk_call(2)]),        // not reached
+        ]);
+        // query budget high (10) so it cannot interfere; char budget = 7.
+        let (out, _pool) = run_loop_full(&backend, 3, 10, 7);
+        assert_eq!(out.reranked_indices, vec![0, 1], "stopped after char budget, both kept");
+        assert!(!out.fallback_used, "char budget with chunks → UseAccumulated");
+        assert!(out.skip_reason.is_none());
+    }
+
+    #[test]
+    fn char_budget_zero_disables_limit() {
+        // char budget = 0 → no char cap. Agent adds 3 chunks then finishes; all
+        // kept, never tripped a char-budget stop.
+        let backend = MockBackend::new(vec![
+            MockTurn::Calls(vec![add_chunks_call(&[0, 1, 2])]),
+            MockTurn::Text("done".into()),
+        ]);
+        let (out, _pool) = run_loop_full(&backend, 3, 10, 0);
+        assert_eq!(out.reranked_indices, vec![0, 1, 2], "no char cap → all kept");
+        assert!(!out.fallback_used);
+    }
+
+    #[test]
+    fn char_budget_single_call_many_chunks_counts_all() {
+        // ONE add_chunks call commits 3 chunks = 18 chars (3 × "stored"). With
+        // budget = 10, the boundary check after that single turn sees 18 >= 10 and
+        // stops — but all 3 chunks committed in that call are kept.
+        let backend = MockBackend::new(vec![
+            MockTurn::Calls(vec![add_chunks_call(&[0, 1, 2])]),
+            MockTurn::Text("done".into()), // not reached
+        ]);
+        let (out, _pool) = run_loop_full(&backend, 3, 10, 10);
+        assert_eq!(out.reranked_indices, vec![0, 1, 2], "all chunks from the over-budget call kept");
+        assert!(!out.fallback_used);
+    }
+
+    #[test]
+    fn consecutive_add_chunks_rejected_without_query() {
+        // The cadence gate: a second add_chunks in a row (without an interleaved
+        // query) is rejected. Only the first phase's chunks are committed.
+        // Turn 0: add_chunks([0]) → OK, awaiting_query = true.
+        // Turn 1: add_chunks([1]) → rejected (must query first).
+        // Turn 2: add_chunks([2]) → rejected again.
+        // Loop hits iteration cap with only chunk 0 committed.
+        let backend = MockBackend::new(vec![
+            MockTurn::Calls(vec![add_chunk_call(0)]),
+            MockTurn::Calls(vec![add_chunk_call(1)]),
+            MockTurn::Calls(vec![add_chunk_call(2)]),
+            MockTurn::Text("done".into()),
+        ]);
+        let (out, _pool) = run_loop_full(&backend, 3, 10, 50_000);
+        assert_eq!(out.reranked_indices, vec![0], "only first add_chunks committed");
+        assert!(!out.fallback_used);
+    }
+
+    #[test]
+    fn char_budget_takes_priority_over_query_budget_on_tie() {
+        // Decisive ordering proof against the pure `boundary_exit` the loop uses:
+        // when a char stop is already flagged AND the query budget is also
+        // exhausted in the same response, ChunkCharBudget wins.
+        let exit = boundary_exit(Some(LoopExit::ChunkCharBudget), /*query_calls*/ 3, /*budget*/ 3);
+        assert_eq!(exit, Some(LoopExit::ChunkCharBudget), "char stop wins the tie");
+
+        // No char stop, query budget exhausted → QueryBudget.
+        assert_eq!(boundary_exit(None, 3, 3), Some(LoopExit::QueryBudget));
+        // Neither tripped → continue.
+        assert_eq!(boundary_exit(None, 1, 3), None);
+        // Char stop with query budget NOT exhausted → still ChunkCharBudget.
+        assert_eq!(boundary_exit(Some(LoopExit::ChunkCharBudget), 0, 3), Some(LoopExit::ChunkCharBudget));
+    }
+
+    #[test]
+    fn char_budget_priority_end_to_end_keeps_chunk() {
+        // End-to-end through the real loop: one response with query (exhausts
+        // query_budget=1) THEN add_chunk (crosses char_budget=6). The committed
+        // chunk must be kept (UseAccumulated), confirming the char stop did not
+        // discard work and the loop terminated cleanly.
+        let sub = vec![chunk(50, 60)];
+        let backend = MockBackend::with_sub_query(
+            vec![
+                MockTurn::Calls(vec![
+                    ToolCall { name: "query".to_owned(), id: Some("q".into()),
+                               args: json!({ "information_request": "x" }), ..Default::default() },
+                    add_chunk_call(0), // +6 == char_budget 6 → mid-turn ChunkCharBudget
+                ]),
+                MockTurn::Text("done".into()), // not reached
+            ],
+            sub,
+        );
+        let (out, _pool) = run_loop_full(&backend, 2, 1, 6);
+        assert_eq!(out.reranked_indices, vec![0], "committed chunk kept");
+        assert!(!out.fallback_used);
+        assert!(out.skip_reason.is_none(), "UseAccumulated, not a fallback");
     }
 }

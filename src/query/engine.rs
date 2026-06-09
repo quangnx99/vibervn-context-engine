@@ -89,6 +89,9 @@ pub async fn run_query(
     min_prune_lines: u32,
     llm_client: Option<&LlmClient>,
     warm_wait: std::time::Duration,
+    agentic_rag: bool,
+    agentic_rag_max_turns: u32,
+    agentic_rag_max_chunk_chars: u32,
 ) -> Result<QueryResult> {
     let total_start = Instant::now();
 
@@ -207,19 +210,47 @@ pub async fn run_query(
 
     // ── Step 6: Rerank ────────────────────────────────────────────────────
     let rerank_start = Instant::now();
-    let rerank_output = reranker::rerank(query, &merged, &numbered, &caller_stats, min_prune_lines, llm_client).await;
+    // `extended_pool` is Some only on the agentic path: its chunks/numbered are
+    // the base candidates followed by any `query`-tool results, and the returned
+    // indices address THAT pool. On the single-shot path it's None and indices
+    // address the base `merged`/`numbered`.
+    let (rerank_output, extended_pool) = match (agentic_rag, llm_client, repo_filter) {
+        (true, Some(client), Some(repo)) => {
+            let (out, pool) = reranker::rerank_agentic(
+                query, &merged, &numbered, &caller_stats, min_prune_lines,
+                client, agentic_rag_max_turns, agentic_rag_max_chunk_chars,
+                repo, voyage_client, index_engine, repo_dbs, warm_wait,
+            ).await;
+            (out, Some(pool))
+        }
+        _ => {
+            let out = reranker::rerank(query, &merged, &numbered, &caller_stats, min_prune_lines, llm_client).await;
+            (out, None)
+        }
+    };
     let rerank_ms = rerank_start.elapsed().as_millis() as u64;
 
     // ── Step 7: Format ────────────────────────────────────────────────────
+    // Resolve reranked indices against the extended pool when present (agentic),
+    // else the base merged set. The pool's first `merged.len()` entries ARE the
+    // base chunks, so base-index selections still resolve correctly; only
+    // sub-query chunks (index >= base len) live exclusively in the pool.
+    let (res_chunks, res_numbered): (&[MergeChunk], &[Option<String>]) = match &extended_pool {
+        Some(pool) => (&pool.chunks, &pool.numbered),
+        None => (&merged, &numbered),
+    };
+
     // Build final results in reranked order. When the LLM selected line ranges
     // for a chunk, emit one block per range (sliced from the already-read
     // numbered text — no re-read); otherwise emit the whole chunk.
     let mut results: Vec<CodeResult> = Vec::new();
     for (k, &idx) in rerank_output.reranked_indices.iter().enumerate() {
-        let Some(chunk) = merged.get(idx) else { continue };
+        let Some(chunk) = res_chunks.get(idx) else { continue };
+        // Caller stats are computed only for the base candidate set; chunks
+        // pulled in by the `query` tool (index >= merged.len()) have none.
         let stats = caller_stats.get(idx).copied().flatten();
         let (callers, caller_files) = stats.map_or((None, None), |s| (Some(s.0), Some(s.1)));
-        let numbered_text = numbered.get(idx).and_then(|n| n.as_deref());
+        let numbered_text = res_numbered.get(idx).and_then(|n| n.as_deref());
         let selection = rerank_output.line_selections.get(k).and_then(|s| s.as_ref());
         match (numbered_text, selection) {
             (Some(text), Some(ranges)) if !ranges.is_empty() => {
@@ -305,6 +336,82 @@ pub async fn run_query(
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
+
+/// Sub-query: embed → vector search → graph expand → merge. NO rerank stage.
+/// Used exclusively by the agentic rerank loop's `query` tool. Cannot recurse
+/// into rerank because it has no `llm_client` and no rerank call.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_sub_query(
+    query: &str,
+    top_k: usize,
+    repo_filter: &str,
+    voyage_client: &VoyageClient,
+    index_engine: &Arc<IndexEngine>,
+    repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
+    warm_wait: std::time::Duration,
+) -> Result<Vec<MergeChunk>> {
+    let embedding = voyage_client.embed_query(query).await?;
+    if embedding.is_empty() {
+        bail!("embed_query returned an empty vector");
+    }
+
+    let raw_results = index_engine.vector_search(&embedding, top_k * 2, Some(repo_filter), warm_wait).await;
+    if raw_results.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let filtered: Vec<_> = raw_results
+        .into_iter()
+        .filter(|r| path_in_repo(&r.chunk_id.file, repo_filter))
+        .collect();
+
+    // Clone DB handles then drop the read lock — no guard spans the await below.
+    let db_map: HashMap<String, Surreal<Db>> = {
+        let guard = repo_dbs.read().await;
+        guard.clone()
+    };
+
+    let mut base_chunks: Vec<MergeChunk> = Vec::with_capacity(filtered.len());
+    for sr in &filtered {
+        let (content, symbol, symbol_fqn) =
+            fetch_chunk_content(&db_map, &sr.chunk_id.file, sr.chunk_id.line_start, sr.chunk_id.line_end).await;
+        base_chunks.push(MergeChunk {
+            file: sr.chunk_id.file.clone(),
+            line_start: sr.chunk_id.line_start,
+            line_end: sr.chunk_id.line_end,
+            score: sr.score,
+            content,
+            symbol,
+            symbol_fqn,
+        });
+    }
+
+    let schema_version = {
+        let db_map_guard = repo_dbs.read().await;
+        if let Some(db) = db_map_guard.values().next() {
+            crate::store::read_db_schema_version(db).await
+        } else {
+            1
+        }
+    };
+
+    let expanded = graph_expand(&base_chunks, &db_map, schema_version).await;
+
+    let mut all_chunks = base_chunks;
+    for e in expanded {
+        all_chunks.push(MergeChunk {
+            file: e.file,
+            line_start: e.line_start,
+            line_end: e.line_end,
+            score: e.score,
+            content: e.content,
+            symbol: e.symbol,
+            symbol_fqn: e.symbol_fqn,
+        });
+    }
+
+    Ok(merge_chunks(all_chunks, top_k))
+}
 
 /// (callers_count, distinct_caller_files) for a single chunk's symbol.
 type CallerStats = (u32, u32);

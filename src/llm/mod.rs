@@ -8,6 +8,54 @@ use reqwest::Client;
 use tracing::warn;
 use crate::config::LlmConfig;
 
+// ─── Shared types for tool-calling ───────────────────────────────────────
+
+/// A tool definition passed to the LLM.
+#[derive(Clone)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// A single tool call the model wants to make.
+#[derive(Clone, Debug, Default)]
+pub struct ToolCall {
+    pub name: String,
+    pub id: Option<String>,
+    pub args: serde_json::Value,
+    /// Gemini 2.5/3.x: an opaque `thoughtSignature` attached (at the part level,
+    /// as a sibling of `functionCall`) when the model emits a tool call while
+    /// thinking is active. It MUST be echoed verbatim when this model turn is
+    /// replayed in the conversation history, or the next request 400s with
+    /// "Function call is missing a thought_signature". `None` for providers /
+    /// models that don't produce one (OpenAI, non-thinking Gemini).
+    pub thought_signature: Option<String>,
+}
+
+/// A tool result to send back to the model.
+#[derive(Clone)]
+pub struct ToolResult {
+    pub name: String,
+    pub id: Option<String>,
+    pub content: String,
+}
+
+/// Conversation messages for multi-turn tool-calling.
+pub enum ChatMessage {
+    User(String),
+    ModelToolCalls(Vec<ToolCall>),
+    ToolResults(Vec<ToolResult>),
+}
+
+/// Unified result from a tool-calling turn.
+pub enum ToolTurnResult {
+    Text(String),
+    ToolCalls(Vec<ToolCall>),
+}
+
+// ─── LlmClient ───────────────────────────────────────────────────────────
+
 #[derive(Clone)]
 pub struct LlmClient {
     provider: String,
@@ -19,8 +67,6 @@ pub struct LlmClient {
 }
 
 /// Whether `provider` has a native JSON output mode the reranker can request.
-/// Anything not listed here uses the XML tag-wrapping path regardless of the
-/// `use_structured_output` setting.
 fn provider_supports_structured_output(provider: &str) -> bool {
     matches!(provider, "google" | "openai")
 }
@@ -46,9 +92,6 @@ impl LlmClient {
     }
 
     /// Whether this client will request native JSON output for reranking.
-    /// True only when the setting is enabled AND the provider supports it; when
-    /// the setting is on but the provider lacks a JSON mode, logs a warning once
-    /// per call decision so operators see why the XML path is used.
     pub fn structured_output_active(&self) -> bool {
         if !self.use_structured_output {
             return false;
@@ -103,6 +146,96 @@ impl LlmClient {
             let key_idx = (start_cursor + offset) % n_keys;
             let key = &self.api_keys[key_idx];
             match self.call_provider(system, user, temperature, structured, key).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap())
+    }
+
+    /// Dispatch to the provider-specific tool-calling function.
+    async fn call_provider_with_tools(
+        &self,
+        system: &str,
+        contents: &[ChatMessage],
+        tools: &[ToolDef],
+        temperature: f32,
+        force_tool_use: bool,
+        key: &str,
+    ) -> Result<ToolTurnResult> {
+        match self.provider.as_str() {
+            "google" => {
+                let r = google::complete_with_tools(&self.http, &self.model, key, system, contents, tools, temperature, force_tool_use).await?;
+                match r {
+                    google::ToolTurnResult::Text(t) => Ok(ToolTurnResult::Text(t)),
+                    google::ToolTurnResult::ToolCalls(calls) => Ok(ToolTurnResult::ToolCalls(
+                        calls.into_iter().map(|c| ToolCall {
+                            name: c.call.name,
+                            id: c.call.id,
+                            args: c.call.args,
+                            thought_signature: c.thought_signature,
+                        }).collect()
+                    )),
+                }
+            }
+            "openai" => {
+                let r = openai::complete_with_tools(&self.http, &self.model, key, system, contents, tools, temperature, force_tool_use).await?;
+                match r {
+                    openai::ToolTurnResult::Text(t) => Ok(ToolTurnResult::Text(t)),
+                    openai::ToolTurnResult::ToolCalls(calls) => Ok(ToolTurnResult::ToolCalls(
+                        calls.into_iter().map(|c| {
+                            let args = serde_json::from_str(&c.function.arguments).unwrap_or(serde_json::Value::Object(Default::default()));
+                            ToolCall { name: c.function.name, id: Some(c.id), args, thought_signature: None }
+                        }).collect()
+                    )),
+                }
+            }
+            other => bail!("unsupported LLM provider for tool-calling: {other}"),
+        }
+    }
+
+    /// Send a tool-calling request with key rotation + retry.
+    ///
+    /// `force_tool_use`: when true, the provider is told the model MUST emit a
+    /// tool call and may NOT reply with prose (Gemini `mode:ANY`, OpenAI
+    /// `tool_choice:required`). The agentic loop sets this while no chunk has
+    /// been committed yet, so the model cannot answer the question directly
+    /// instead of selecting chunks. Once a chunk is added it flips to false so
+    /// the agent can finish with a text summary.
+    pub async fn complete_with_tools(
+        &self,
+        system: &str,
+        contents: &[ChatMessage],
+        tools: &[ToolDef],
+        temperature: f32,
+        force_tool_use: bool,
+    ) -> Result<ToolTurnResult> {
+        let n_keys = self.api_keys.len();
+        let start_cursor = self.key_cursor.fetch_add(1, Ordering::Relaxed) % n_keys;
+
+        let mut last_err = None;
+
+        for offset in 0..n_keys {
+            let key_idx = (start_cursor + offset) % n_keys;
+            let key = &self.api_keys[key_idx];
+            match self.call_provider_with_tools(system, contents, tools, temperature, force_tool_use, key).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    warn!(key_index = key_idx, error = %e, "LLM tool-call failed — trying next key");
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        for offset in 0..n_keys {
+            let key_idx = (start_cursor + offset) % n_keys;
+            let key = &self.api_keys[key_idx];
+            match self.call_provider_with_tools(system, contents, tools, temperature, force_tool_use, key).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     last_err = Some(e);
