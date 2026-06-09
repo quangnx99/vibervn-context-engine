@@ -341,6 +341,9 @@
                  class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
                         placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
                         focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+          <p data-i18n="llm.rerankModelHint" class="text-amber-600 dark:text-amber-400 text-xs mt-1">
+            ⚡ For best speed, use a Google -flash-lite model (e.g. gemini-3.1-flash-lite).
+          </p>
         </div>
         <div class="mb-4">
           <label data-i18n="llm.minPrune" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="llm-min-prune-lines">
@@ -1110,7 +1113,8 @@ const STR = {
 
   // Settings — LLM
   'llm.heading':       { en: `LLM Keys`, vi: `LLM Key`, zh: `LLM 密钥` },
-  'llm.rerankModel':   { en: `Rerank model`, vi: `Rerank model`, zh: `重排序模型` },
+  'llm.rerankModel':   { en: `Model`, vi: `Model`, zh: `模型` },
+  'llm.rerankModelHint': { en: `⚡ For best speed, use a Google -flash-lite model (e.g. gemini-3.1-flash-lite).`, vi: `⚡ Để có tốc độ nhanh nhất, hãy ưu tiên dùng model dòng -flash-lite của Google (vd: gemini-3.1-flash-lite).`, zh: `⚡ 为获得最快速度，建议使用 Google -flash-lite 系列模型（如 gemini-3.1-flash-lite）。` },
   'llm.minPrune':      { en: `Min prune lines`, vi: `Số dòng tối thiểu để prune`, zh: `最小裁剪行数` },
   'llm.minPruneHelp':  { en: `Chunks smaller than this many lines are returned whole; larger ones may be narrowed to relevant line ranges.`,
                          vi: `Các chunk nhỏ hơn số dòng này được trả về nguyên vẹn; chunk lớn hơn có thể được thu hẹp về các khoảng dòng liên quan.`,
