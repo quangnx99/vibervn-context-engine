@@ -685,6 +685,15 @@ async fn query_caller_callee_stats(
             .ok()?
     };
 
+    // Only count edges whose caller symbol name is known. Rows with a NULL/empty
+    // in_name (v1→v2 migrated DBs where link-deref failed) would otherwise inflate
+    // the count while contributing no displayable name → bare "[callers:N]".
+    // Filtering at the source keeps count and names consistent.
+    let caller_rows: Vec<CallerRow> = caller_rows
+        .into_iter()
+        .filter(|r| r.in_name.as_deref().is_some_and(|n| !n.is_empty()))
+        .collect();
+
     let caller_count = caller_rows.len() as u32;
     let distinct_caller_files: HashSet<&str> = caller_rows.iter().map(|r| r.in_file.as_str()).collect();
     let caller_file_count = distinct_caller_files.len() as u32;
@@ -715,6 +724,13 @@ async fn query_caller_callee_stats(
             .take(0)
             .ok()?
     };
+
+    // Same consistency guarantee as callers: drop edges with a NULL/empty
+    // out_name so callee_count never exceeds the number of displayable names.
+    let callee_rows: Vec<CalleeRow> = callee_rows
+        .into_iter()
+        .filter(|r| r.out_name.as_deref().is_some_and(|n| !n.is_empty()))
+        .collect();
 
     let callee_count = callee_rows.len() as u32;
     let distinct_callee_files: HashSet<&str> = callee_rows.iter().map(|r| r.out_file.as_str()).collect();

@@ -169,20 +169,28 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
         // that was merged into this entry — used for output ordering.
         let mut merged: Vec<(usize, OutputBlock, Vec<String>)> = Vec::new();
 
-        for (orig_idx, next) in group {
+        for (orig_idx, mut next) in group {
             if let Some((min_idx, current, originals)) = merged.last_mut() {
                 if next.line_start <= current.line_end + 1 {
                     current.line_end = current.line_end.max(next.line_end);
                     *min_idx = (*min_idx).min(orig_idx);
-                    // Combine caller stats: take the max across merged blocks.
-                    current.callers = match (current.callers, next.callers) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (a, b) => a.or(b),
-                    };
-                    current.caller_files = match (current.caller_files, next.caller_files) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (a, b) => a.or(b),
-                    };
+                    // Combine caller/callee stats: the two merged blocks usually
+                    // belong to DIFFERENT symbols (e.g. an import region vs. a
+                    // function), so the count and its names MUST travel together —
+                    // adopt them as an atomic triple/pair from whichever block has
+                    // the higher count. If we bumped only the count (old behavior),
+                    // a merged block could carry callers=Some(N) with empty names,
+                    // tripping the `names.is_empty()` fallback in
+                    // format_enriched_caller_tag and emitting a bare "[callers:N]".
+                    if next.callers.unwrap_or(0) > current.callers.unwrap_or(0) {
+                        current.callers = next.callers;
+                        current.caller_files = next.caller_files;
+                        current.caller_names = std::mem::take(&mut next.caller_names);
+                    }
+                    if next.callees.unwrap_or(0) > current.callees.unwrap_or(0) {
+                        current.callees = next.callees;
+                        current.callee_names = std::mem::take(&mut next.callee_names);
+                    }
                     originals.push(next.content);
                 } else {
                     let content_snapshot = next.content.clone();
@@ -1178,6 +1186,64 @@ mod tests {
         assert_eq!(merged[0].caller_files, Some(4));
         // Header includes the combined caller tag (count-only format for merged blocks).
         assert_eq!(merged[0].header, "a.rs#L1-75 [callers:7]");
+    }
+
+    #[test]
+    fn merge_blocks_carries_caller_and_callee_names() {
+        // Regression: the names MUST travel with the count through a merge.
+        // Block A is name-less (the import region), Block B carries the real
+        // symbol's counts AND names. Old merge logic bumped only the counts,
+        // leaving A's empty names → bare "[callers:N]". Now the higher-count
+        // block's names are adopted atomically with its count.
+        let blocks = vec![
+            OutputBlock {
+                file: "a.rs".into(),
+                content: "1: use foo;".into(),
+                line_start: 1,
+                line_end: 50,
+                callers: None,
+                caller_names: vec![],
+                callees: None,
+                callee_names: vec![],
+                ..Default::default()
+            },
+            OutputBlock {
+                file: "a.rs".into(),
+                content: "26: fn x".into(),
+                line_start: 26,
+                line_end: 75,
+                callers: Some(2),
+                caller_files: Some(1),
+                caller_names: vec!["foo".into(), "bar".into()],
+                callees: Some(1),
+                callee_names: vec!["baz".into()],
+                ..Default::default()
+            },
+        ];
+        let merged = merge_overlapping_blocks(blocks);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].callers, Some(2));
+        assert_eq!(merged[0].caller_names, vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(merged[0].callees, Some(1));
+        assert_eq!(merged[0].callee_names, vec!["baz".to_string()]);
+        // Header renders the NAMED form, not the bare count fallback.
+        // (a.rs doesn't exist on disk, so the multi-block merge falls back to a
+        // content union — only the header tags matter for this assertion.)
+        assert!(
+            merged[0].header.contains("[callers: foo, bar]"),
+            "header missing named callers: {}",
+            merged[0].header
+        );
+        assert!(
+            merged[0].header.contains("[calls: baz]"),
+            "header missing named callees: {}",
+            merged[0].header
+        );
+        assert!(
+            !merged[0].header.contains("[callers:2]"),
+            "header fell back to bare count: {}",
+            merged[0].header
+        );
     }
 
     #[test]
