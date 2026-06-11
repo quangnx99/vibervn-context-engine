@@ -270,7 +270,7 @@
       </section>
 
       <!-- Section: Purchased Plans -->
-      <section id="plan-purchased-section" class="mb-8 hidden">
+      <section id="plan-purchased-section" class="mb-8">
         <h2 data-i18n="plan.purchased" class="font-wiki text-xl dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-4">
           Purchased Plans
         </h2>
@@ -2361,8 +2361,8 @@ function renderPurchasedPlans() {
   const plans = loadPurchasedPlans();
   const section = document.getElementById('plan-purchased-section');
   const list = document.getElementById('plan-purchased-list');
-  if (!plans.length) { section.classList.add('hidden'); return; }
   section.classList.remove('hidden');
+  if (!plans.length) { list.innerHTML = ''; return; }
   list.innerHTML = plans.map(p => {
     const masked = p.proxy_key ? '••••••••' + p.proxy_key.slice(-4) : '—';
     const dateStr = p.purchased_at ? new Date(p.purchased_at).toLocaleDateString() : '';
