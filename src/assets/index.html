@@ -2643,7 +2643,6 @@ function renderPurchasedPlans() {
       </div>
       <div class="flex items-center gap-2 ml-4">
         <button class="plan-row-apply px-2 py-1 text-xs bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link rounded hover:bg-blue-700 dark:hover:bg-wiki-border-active/30">${t('plan.apply')}</button>
-        <button class="plan-row-replace px-2 py-1 text-xs bg-red-600 dark:bg-red-700/30 dark:border dark:border-red-600/50 text-white dark:text-red-300 rounded hover:bg-red-700 dark:hover:bg-red-700/50">${t('plan.replace')}</button>
         <button class="plan-row-remove px-2 py-1 text-xs border border-gray-300 dark:border-wiki-border text-gray-500 dark:text-wiki-text-muted rounded hover:bg-gray-100 dark:hover:bg-wiki-surface">${t('plan.purchased.remove')}</button>
       </div>
     </div>`;
@@ -2797,15 +2796,12 @@ document.getElementById('plan-purchased-list').addEventListener('click', (e) => 
   if (!entry) return;
 
   if (e.target.closest('.plan-row-apply')) {
-    planApplyEntry(entry);
+    // "Apply to Settings" replaces all existing keys with this one (was two
+    // separate buttons; merged into one for a simpler card UX).
+    planReplaceEntry(entry);
     const btn = e.target.closest('.plan-row-apply');
     btn.textContent = t('plan.applied');
     setTimeout(() => { btn.textContent = t('plan.apply'); }, 1500);
-  } else if (e.target.closest('.plan-row-replace')) {
-    planReplaceEntry(entry);
-    const btn = e.target.closest('.plan-row-replace');
-    btn.textContent = t('plan.replaced');
-    setTimeout(() => { btn.textContent = t('plan.replace'); }, 1500);
   } else if (e.target.closest('.plan-row-remove')) {
     removePurchasedPlan(invoice);
   } else if (e.target.closest('.plan-copy-key-btn')) {
