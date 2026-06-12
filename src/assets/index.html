@@ -1081,6 +1081,13 @@ let saveTimer = null;
 let indexStatuses = {}; // keyed by repo path
 let indexPollTimer = null;
 let repoFilter = '';
+// True while a PUT /api/config is actually in flight. Combined with a pending
+// saveTimer, this tells the index poll NOT to re-sync cfg.repos from disk: a
+// background GET /api/config reads DISK, which lags an in-flight save's disk
+// write, so a re-sync mid-save would clobber an optimistic add/remove with the
+// pre-save list (the repo row vanishes until the next reload).
+let saveInFlight = false;
+function isSavePending() { return saveInFlight || saveTimer !== null; }
 // Repos whose server-side teardown is in flight. renderRepos() hides them so the
 // row disappears instantly on "Remove Repo" while the slow DELETE runs in the
 // background (see the btn-remove-repo handler).
@@ -1102,6 +1109,19 @@ function isWindowsOS() {
 }
 function exampleRepoPath() {
   return isWindowsOS() ? 'D:\\projects\\my-app' : '~/projects/my-app';
+}
+
+// Mirrors Rust store::normalize_repo_path so a freshly-added repo's identity
+// matches the value the server persists and keys indexStatuses by. Without this
+// the optimistic row carries raw case (D:\…) while the server returns lowercase
+// (d:\…): the row's status badge never binds, and the index poll's "unknown
+// repo" heuristic misfires every tick. Windows → backslashes + lowercase;
+// elsewhere → forward slashes. Both trim trailing separators.
+function normalizeRepoPath(repo) {
+  let s = isWindowsOS()
+    ? repo.replace(/\//g, '\\').toLowerCase()
+    : repo.replace(/\\/g, '/');
+  return s.replace(/[\\/]+$/, '');
 }
 
 // Hand-built inline SVG flags (no emoji — Windows renders flag emoji as letter
@@ -1534,6 +1554,10 @@ async function syncReposFromConfig() {
     const res = await fetch('/api/config');
     if (!res.ok) return;
     const fresh = await res.json();
+    // A save may have started while this GET was in flight; its disk write can
+    // lag, so the body we just read may predate it. Don't clobber an in-flight
+    // optimistic mutation — the save's own renderRepos() is authoritative.
+    if (isSavePending()) return;
     if (fresh && Array.isArray(fresh.repos)) {
       if (cfg) { cfg.repos = fresh.repos; } else { cfg = fresh; }
       renderRepos();
@@ -1553,9 +1577,12 @@ async function pollIndexStatus() {
     indexStatuses = newStatuses;
     // If a repo appears in status (e.g. auto-registered by an MCP call) but is
     // not yet in our cfg.repos, refresh the repo list without a full reload.
+    // Skip while a save is pending/in-flight: GET /api/config reads disk, which
+    // lags the in-flight PUT's write, so re-syncing now would clobber the user's
+    // optimistic add/remove with the stale pre-save list (row vanishes until reload).
     const known = (cfg && cfg.repos) ? cfg.repos : [];
     const hasNewRepo = Object.keys(newStatuses).some(r => !known.includes(r));
-    if (hasNewRepo) { await syncReposFromConfig(); }
+    if (hasNewRepo && !isSavePending()) { await syncReposFromConfig(); }
     updateRepoIndexUI();
   } catch (_) { /* ignore network errors in polling */ }
   scheduleNextPoll();
@@ -1961,6 +1988,8 @@ function escHtml(str) {
 // ─── Save ──────────────────────────────────────────────────────────────────
 async function saveNow() {
   clearTimeout(saveTimer);
+  saveTimer = null;
+  saveInFlight = true;
   hideError();
   try {
     const res = await fetch('/api/config', {
@@ -1979,6 +2008,8 @@ async function saveNow() {
     showToast();
   } catch (err) {
     showError(t('err.network', { msg: err.message }));
+  } finally {
+    saveInFlight = false;
   }
 }
 
@@ -2033,12 +2064,17 @@ document.getElementById('btn-retry').addEventListener('click', () => { hideError
 
 function handleAddRepo() {
   const input = document.getElementById('input-repo');
-  const val = input.value.trim();
-  if (!val) return;
+  const raw = input.value.trim();
+  if (!raw) return;
   const warning = document.getElementById('repo-warning');
-  const isAbsolute = val.startsWith('/') || /^[A-Za-z]:[\\\/]/.test(val);
+  const isAbsolute = raw.startsWith('/') || /^[A-Za-z]:[\\\/]/.test(raw);
   if (!isAbsolute) { warning.classList.remove('hidden'); } else { warning.classList.add('hidden'); }
+  // Normalize to the server's canonical form so the optimistic row's identity
+  // matches what the PUT response returns and what indexStatuses is keyed by —
+  // otherwise the status badge never binds and the poll re-syncs on every tick.
+  const val = normalizeRepoPath(raw);
   if (!cfg.repos) cfg.repos = [];
+  if (cfg.repos.includes(val)) { input.value = ''; return; }  // already configured — no-op
   cfg.repos.push(val);
   input.value = '';
   repoFilter = '';
