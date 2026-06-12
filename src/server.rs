@@ -463,14 +463,27 @@ async fn post_cancel_index(
 }
 
 /// DELETE /api/repos/:repo_id/index — remove the index DB folder for a repo.
+///
+/// `?remove_repo=true` additionally drops the repo from `settings.repos` in the
+/// SAME durable write that bumps the generation, so "Remove Repo" is committed
+/// server-side and survives a reload even if the client never sends a follow-up
+/// PUT /api/config (or reloads mid-teardown — the on-disk lock-drain below can
+/// take many seconds on Windows). Without the flag the repo stays configured and
+/// only its index is torn down ("Remove Index").
 async fn delete_repo_index(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let repo = match decode_repo_id(&repo_id) {
         Ok(r) => r,
         Err(r) => return r,
     };
+
+    let remove_repo = params
+        .get("remove_repo")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
 
     // Resolve the generation BEFORE the bump — this is the directory currently on
     // disk that we must remove. The read guard is dropped immediately.
@@ -500,10 +513,21 @@ async fn delete_repo_index(
     // see put_config).
     let next_generation = current_generation.saturating_add(1);
     let target = config_path(&state.home_dir);
+    let normalized_repo = crate::store::normalize_repo_path(&repo);
     let to_write = {
         let mut s = state.settings.read().await.clone();
         s.repo_generations
-            .insert(crate::store::normalize_repo_path(&repo), next_generation);
+            .insert(normalized_repo.clone(), next_generation);
+        // "Remove Repo": drop it from the configured list in the SAME durable
+        // write as the generation bump. Doing it here (not via a follow-up PUT
+        // /api/config) makes the removal durable BEFORE the slow lock-drain below,
+        // so a reload mid-teardown — or a lost PUT — can't resurrect the repo from
+        // disk. The generation entry is intentionally KEPT (see repo_generations
+        // doc) so a future re-add reuses the higher generation instead of racing
+        // the still-draining old LOCK.
+        if remove_repo {
+            s.repos.retain(|r| r != &normalized_repo);
+        }
         s
     };
     let persist = tokio::task::spawn_blocking({
@@ -513,13 +537,16 @@ async fn delete_repo_index(
     .await;
     match persist {
         Ok(Ok(())) => {
-            // Disk write succeeded — now swap memory under the write lock.
-            state
-                .settings
-                .write()
-                .await
+            // Disk write succeeded — now swap memory under the write lock so the
+            // live handle matches disk (GET /api/config reads disk; in-memory is
+            // the source of truth for indexing triggers and the put_config diff).
+            let mut guard = state.settings.write().await;
+            guard
                 .repo_generations
-                .insert(crate::store::normalize_repo_path(&repo), next_generation);
+                .insert(normalized_repo.clone(), next_generation);
+            if remove_repo {
+                guard.repos.retain(|r| r != &normalized_repo);
+            }
         }
         Ok(Err(e)) => {
             // Persisting the bump failed. Without a durable bump a re-index could
@@ -534,6 +561,15 @@ async fn delete_repo_index(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
         }
     }
+
+    // NOTE: even for a full "Remove Repo" we deliberately do NOT drop the
+    // in-memory status entry — `clear_repo_index` above reset it in place. The
+    // detached watcher has no stop handle, so the status entry is the only thing
+    // that keeps a future `register_repo` (re-add) from spawning a second watcher
+    // (unbounded growth on repeated remove/re-add). The leftover idle entry is
+    // harmless: GET /api/config (disk) no longer lists the repo, so the UI renders
+    // it gone; the poll may re-sync once per tick, the same bounded path already
+    // used to surface MCP-auto-registered repos.
 
     // Now remove the OLD generation's directory WITHOUT the open gate. The bump above
     // is durable, so every future open targets `next_generation` — nothing can race

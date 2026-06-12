@@ -682,6 +682,104 @@ async fn test_delete_bumps_generation_and_put_preserves_it() {
     );
 }
 
+// ─── Test 7a'': DELETE ?remove_repo=true is durable on disk ───────────────────
+//
+// Regression test for the "removed repo reappears after reload" bug. The old flow
+// only removed the repo from settings.repos via a follow-up client PUT /api/config
+// AFTER the (slow) DELETE resolved; if that PUT was ever lost (reload mid-teardown,
+// navigation, clobbered write) the repo survived on disk and came back on reload.
+// The fix: DELETE ...?remove_repo=true drops the repo from settings.repos in the
+// same durable write that bumps the generation. This test asserts the removal is
+// persisted to disk (a fresh GET /api/config no longer lists it) WITHOUT any PUT,
+// and that the other repo is untouched.
+#[tokio::test]
+async fn test_delete_remove_repo_persists_to_disk() {
+    use context_engine_rs::store;
+
+    let home = TempDir::new().expect("tempdir");
+    let addr = start_server(&home).await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("client");
+
+    let repo_a = "D:/fake/repo/remove_durable_a";
+    let repo_b = "D:/fake/repo/remove_durable_b";
+    let repo_a_id = encode_repo_id(repo_a);
+
+    // Configure two repos. Send a complete embedding/llm block — the PUT validates
+    // required provider/model fields, and this test needs the repos to actually
+    // persist (unlike the generation tests, which ignore the PUT status).
+    let put_body = serde_json::json!({
+        "version": 1,
+        "repos": [repo_a, repo_b],
+        "embedding": { "provider": "voyage", "model": "voyage-4-lite", "api_keys": ["test-key-remove"] },
+        "llm": { "provider": "google", "rerank_model": "gemini-3.1-flash-lite", "api_keys": [] }
+    });
+    let put_res = client
+        .put(format!("http://{addr}/api/config"))
+        .json(&put_body)
+        .send()
+        .await
+        .expect("put config");
+    let put_status = put_res.status().as_u16();
+    assert_eq!(
+        put_status,
+        200,
+        "PUT should return 200; body: {:?}",
+        put_res.text().await
+    );
+
+    // Remove repo A with the durable flag — and crucially send NO follow-up PUT.
+    let del_res = client
+        .delete(format!(
+            "http://{addr}/api/repos/{repo_a_id}/index?remove_repo=true"
+        ))
+        .send()
+        .await
+        .expect("delete repo");
+    assert_eq!(
+        del_res.status().as_u16(),
+        200,
+        "delete should succeed: {:?}",
+        del_res.text().await
+    );
+
+    // A fresh GET reads settings.json from disk (ensure_dir_and_load). Repo A must
+    // be gone, repo B must remain, and A's generation bump must be recorded.
+    let cfg: serde_json::Value = client
+        .get(format!("http://{addr}/api/config"))
+        .send()
+        .await
+        .expect("get config")
+        .json()
+        .await
+        .expect("parse config");
+
+    let norm_a = store::normalize_repo_path(repo_a);
+    let norm_b = store::normalize_repo_path(repo_b);
+    let repos: Vec<&str> = cfg["repos"]
+        .as_array()
+        .expect("repos array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+
+    assert!(
+        !repos.contains(&norm_a.as_str()),
+        "removed repo must NOT survive on disk (reload bug); got repos: {repos:?}"
+    );
+    assert!(
+        repos.contains(&norm_b.as_str()),
+        "the other repo must be untouched; got repos: {repos:?}"
+    );
+    assert_eq!(
+        cfg["repo_generations"][&norm_a].as_u64(),
+        Some(1),
+        "remove_repo must still bump the generation; got config: {cfg}"
+    );
+}
+
 // ─── Test 7b: DELETE aborts an in-flight schema migration before removal ──
 //
 // Regression test for the bug where a stale-version repo's background migration

@@ -1915,19 +1915,23 @@ function renderRepos() {
       const repo = btn.dataset.repo;
       // Optimistic removal: the server teardown (cancel in-progress index → drop
       // RocksDB handle → Windows lock-drain retry loop → generation bump) can take
-      // seconds, and the server itself treats the repo as "functionally gone from
-      // the user's perspective" the moment we ask. So hide the row INSTANTLY via the
-      // deleting set and confirm with a toast, then run the slow work in the
-      // background. We must NOT splice cfg.repos / saveNow until the DELETE resolves:
-      // the server bumps the server-owned generation during DELETE and a PUT /api/config
-      // that lands first would clobber the bump (see put_config), letting a re-add reuse
-      // the still-draining directory.
+      // seconds. Hide the row INSTANTLY via the deleting set + toast, then run the
+      // slow work in the background.
+      //
+      // The DELETE carries `?remove_repo=true`, so the server drops the repo from
+      // settings.repos in the SAME durable write that bumps the generation —
+      // BEFORE the slow on-disk teardown. That makes the removal survive a reload
+      // even if the user refreshes mid-teardown. Because the server is now
+      // authoritative we do NOT send a follow-up PUT /api/config: the old
+      // delete-then-splice-then-saveNow flow lost the removal whenever that second
+      // request never landed (reload, navigation, or a clobbered write), which is
+      // exactly why a removed repo used to reappear after reload.
       deletingRepos.add(repo);
       renderRepos();
       showToast(t('toast.removed'));
       const repoId = encodeRepoId(repo);
       try {
-        const res = await fetch('/api/repos/' + repoId + '/index', { method: 'DELETE' });
+        const res = await fetch('/api/repos/' + repoId + '/index?remove_repo=true', { method: 'DELETE' });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
           showError(data.error || t('repo.removeRepoFail'));
@@ -1935,12 +1939,13 @@ function renderRepos() {
           renderRepos();
           return;
         }
-        // Server teardown + generation bump are durable. Now drop the repo from the
-        // config and persist — DELETE finished first, so the bump survives the PUT.
+        // Server already persisted the removal (disk + memory). Mirror it into the
+        // local cfg so the row stays gone without re-fetching, then clear the
+        // deleting marker. No saveNow() — the server is the source of truth here.
         const i = (cfg.repos || []).indexOf(repo);
         if (i !== -1) cfg.repos.splice(i, 1);
         deletingRepos.delete(repo);
-        await saveNow();
+        renderRepos();
       } catch (err) {
         showError(t('err.network', { msg: err.message }));
         deletingRepos.delete(repo);
