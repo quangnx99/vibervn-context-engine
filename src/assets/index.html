@@ -286,11 +286,6 @@
                            hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400">
               Apply to Settings
             </button>
-            <button id="btn-plan-replace" data-i18n="plan.replace"
-                    class="px-4 py-2 bg-red-600 dark:bg-red-700/30 dark:border dark:border-red-600/50 text-white dark:text-red-300 text-sm rounded
-                           hover:bg-red-700 dark:hover:bg-red-700/50 focus:outline-none focus:ring-2 focus:ring-red-400">
-              Replace All Keys
-            </button>
             <button id="btn-plan-dismiss" data-i18n="action.close"
                     class="px-4 py-2 text-sm rounded border border-gray-300 dark:border-wiki-border text-gray-600 dark:text-wiki-text-muted
                            hover:bg-gray-100 dark:hover:bg-wiki-surface focus:outline-none focus:ring-2 focus:ring-blue-400">
@@ -1257,8 +1252,6 @@ const STR = {
   'plan.baseUrl':       { en: `Base URL`, vi: `Base URL`, zh: `Base URL` },
   'plan.apply':         { en: `Apply to Settings`, vi: `Áp dụng vào cài đặt`, zh: `应用到设置` },
   'plan.applied':       { en: `Applied!`, vi: `Đã áp dụng!`, zh: `已应用！` },
-  'plan.replace':       { en: `Replace All Keys`, vi: `Xóa key cũ & Áp dụng`, zh: `替换所有密钥` },
-  'plan.replaced':      { en: `Replaced!`, vi: `Đã thay thế!`, zh: `已替换！` },
   'plan.providerHint':  { en: `Your LLM provider is set to Google. To use this key for reranking, switch to OpenAI above.`, vi: `LLM provider đang là Google. Để dùng key này cho rerank, chuyển sang OpenAI ở trên.`, zh: `LLM 提供商当前为 Google。要使用此密钥进行重排序，请在上方切换到 OpenAI。` },
   'plan.duration':      { en: `{n} days`, vi: `{n} ngày`, zh: `{n} 天` },
   'plan.voyage':        { en: `Voyage budget`, vi: `Voyage budget`, zh: `Voyage 预算` },
@@ -2075,17 +2068,19 @@ async function saveNow() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(cfg),
     });
-    if (res.status === 409) { showVersionBanner(); return; }
+    if (res.status === 409) { showVersionBanner(); return false; }
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       showError(data.error || t('err.saveFail', { status: res.status }));
-      return;
+      return false;
     }
     cfg = await res.json();
     renderRepos();
     showToast();
+    return true;
   } catch (err) {
     showError(t('err.network', { msg: err.message }));
+    return false;
   } finally {
     saveInFlight = false;
   }
@@ -2127,6 +2122,14 @@ async function loadConfig() {
     document.getElementById('skeleton').classList.add('hidden');
     document.getElementById('main-content').classList.remove('hidden');
     renderAll();
+    // Fold any plans left in browser localStorage into the server-side config
+    // (one-time, post-upgrade). Clear localStorage ONLY after the PUT confirms
+    // the server persisted them — otherwise a failed save would lose the plans.
+    // They stay in localStorage and get retried on the next load.
+    if (migrateLocalStoragePlans()) {
+      if (await saveNow()) localStorage.removeItem('purchased_plans');
+    }
+    renderPurchasedPlans();
     navigateIfFirstUse();
     planFetchPackages();
     planLoadFreeTrial();
@@ -2535,22 +2538,14 @@ function planApply() {
   const key = document.getElementById('plan-result-key').value;
   const baseUrl = document.getElementById('plan-result-base-url').value;
   if (!key || !baseUrl) return;
-  planApplyEntry({ proxy_key: key, base_url: baseUrl });
+  // "Apply to Settings" replaces all existing keys with this one (matches the
+  // purchased-plan row behavior; the separate "Replace All Keys" button was
+  // removed in favor of this single action).
+  planReplaceEntry({ proxy_key: key, base_url: baseUrl });
   const btn = document.getElementById('btn-plan-apply');
   btn.textContent = t('plan.applied');
   btn.disabled = true;
   setTimeout(() => { btn.textContent = t('plan.apply'); btn.disabled = false; }, 2000);
-}
-
-function planReplace() {
-  const key = document.getElementById('plan-result-key').value;
-  const baseUrl = document.getElementById('plan-result-base-url').value;
-  if (!key || !baseUrl) return;
-  planReplaceEntry({ proxy_key: key, base_url: baseUrl });
-  const btn = document.getElementById('btn-plan-replace');
-  btn.textContent = t('plan.replaced');
-  btn.disabled = true;
-  setTimeout(() => { btn.textContent = t('plan.replace'); btn.disabled = false; }, 2000);
 }
 
 function planApplyEntry(entry) {
@@ -2583,20 +2578,79 @@ function planReplaceEntry(entry) {
   renderAll();
 }
 
-// ─── Purchased Plans (localStorage) ─────────────────────────────────────────
+// ─── Purchased Plans (settings.json via cfg.purchased_plans) ─────────────────
+// Plans live in settings.json (server-side), not localStorage, so they follow
+// the install across browsers/machines. `cfg.purchased_plans` is the live copy;
+// mutations persist through saveNow() (PUT /api/config), which round-trips the
+// list back into cfg. loadPurchasedPlans returns [] when cfg isn't ready yet, so
+// any render before the first /api/config load is a harmless no-op.
 
 function loadPurchasedPlans() {
-  try {
-    return JSON.parse(localStorage.getItem('purchased_plans') || '[]');
-  } catch (_) { return []; }
+  if (!cfg || !Array.isArray(cfg.purchased_plans)) return [];
+  return dedupPurchasedPlans(cfg.purchased_plans);
 }
 
+// Persist the plan list into cfg and push it to the server. Fire-and-forget:
+// saveNow() reassigns cfg from the server response (which echoes the list back),
+// keeping the in-memory copy authoritative.
 function savePurchasedPlans(arr) {
-  localStorage.setItem('purchased_plans', JSON.stringify(arr));
+  if (!cfg) return;
+  cfg.purchased_plans = arr;
+  saveNow();
+}
+
+// The same proxy key can be claimed under multiple invoices (e.g. re-buying the
+// same package extends the expiry but returns the identical key + shared budget
+// pool). Those are one plan, not many, so collapse by proxy_key and keep the
+// entry with the latest expiry. Entries without a key fall back to invoice.
+function dedupPurchasedPlans(plans) {
+  const byKey = new Map();
+  const out = [];
+  for (const p of plans) {
+    const id = p.proxy_key || ('invoice:' + p.invoice);
+    const existing = byKey.get(id);
+    if (!existing) {
+      byKey.set(id, p);
+      out.push(p);
+      continue;
+    }
+    // Prefer the entry that expires later (treat missing expiry as "never").
+    const exp = p.expires_at || Infinity;
+    const existingExp = existing.expires_at || Infinity;
+    if (exp > existingExp) {
+      Object.assign(existing, p);
+    }
+  }
+  return out;
+}
+
+// One-time migration: fold any plans left in browser localStorage (the old
+// storage location) into cfg.purchased_plans. Returns true if cfg was mutated
+// (caller must persist via saveNow, then clear localStorage ONLY after the PUT
+// succeeds — see loadConfig). The legacy key is NOT cleared here: dropping it
+// before the server confirms the write would lose the plans on a failed PUT,
+// defeating the whole point of server-side persistence. When there's nothing to
+// migrate (empty/corrupt) it's safe to clear immediately — no data at risk.
+function migrateLocalStoragePlans() {
+  if (!cfg) return false;
+  let legacy;
+  try {
+    legacy = JSON.parse(localStorage.getItem('purchased_plans') || '[]');
+  } catch (_) { legacy = []; }
+  if (!Array.isArray(legacy) || !legacy.length) {
+    localStorage.removeItem('purchased_plans');
+    return false;
+  }
+  const merged = dedupPurchasedPlans([...(cfg.purchased_plans || []), ...legacy]);
+  cfg.purchased_plans = merged;
+  return true;
 }
 
 function addPurchasedPlan(entry) {
-  const plans = loadPurchasedPlans().filter(p => p.invoice !== entry.invoice);
+  const id = entry.proxy_key || ('invoice:' + entry.invoice);
+  const plans = loadPurchasedPlans().filter(
+    p => (p.proxy_key || ('invoice:' + p.invoice)) !== id
+  );
   plans.unshift(entry);
   savePurchasedPlans(plans);
 }
@@ -2683,14 +2737,19 @@ async function fetchPlanUsage(el, proxyKey) {
       ${renderUsageBar('Voyage', data.voyage_remaining, data.voyage_budget)}
       ${renderUsageBar('OpenAI', data.openai_remaining, data.openai_budget)}
     </div>`;
-    // Sync expires_at from server to localStorage
-    const plans = loadPurchasedPlans();
-    const plan = plans.find(p => p.proxy_key === proxyKey);
-    if (plan && data.expires_at) {
-      const serverExpiry = new Date(data.expires_at).getTime();
-      if (plan.expires_at !== serverExpiry) {
-        plan.expires_at = serverExpiry;
-        savePurchasedPlans(plans);
+    // Sync expires_at from the server into cfg.purchased_plans. Re-read here
+    // (not a snapshot taken before the await) so a plan added/removed during the
+    // network round trip isn't clobbered by a stale write. savePurchasedPlans
+    // only fires a PUT when the value actually changed.
+    if (data.expires_at) {
+      const plans = loadPurchasedPlans();
+      const plan = plans.find(p => p.proxy_key === proxyKey);
+      if (plan) {
+        const serverExpiry = new Date(data.expires_at).getTime();
+        if (plan.expires_at !== serverExpiry) {
+          plan.expires_at = serverExpiry;
+          savePurchasedPlans(plans);
+        }
       }
     }
   } catch (_) { el.innerHTML = ''; }
@@ -2764,7 +2823,6 @@ document.getElementById('btn-plan-cancel-wait').addEventListener('click', () => 
   planInvoice = null;
 });
 document.getElementById('btn-plan-apply').addEventListener('click', planApply);
-document.getElementById('btn-plan-replace').addEventListener('click', planReplace);
 document.getElementById('btn-plan-dismiss').addEventListener('click', () => {
   document.getElementById('plan-success').classList.add('hidden');
 });
@@ -2815,8 +2873,8 @@ document.getElementById('plan-purchased-list').addEventListener('click', (e) => 
   }
 });
 
-// Render purchased plans on startup
-renderPurchasedPlans();
+// Purchased plans render after cfg loads (see loadConfig) — they live in
+// settings.json now, so there's nothing to show before the first config fetch.
 
 // Plan card collapse toggle
 (function() {

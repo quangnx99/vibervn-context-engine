@@ -10,14 +10,14 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 
 /// Bump this when a new migration is appended to MIGRATIONS.
-pub const CURRENT_VERSION: u32 = 8;
+pub const CURRENT_VERSION: u32 = 9;
 
 /// Migration function type: transforms a JSON Value from version N to version N+1.
 pub type MigrationFn = fn(Value) -> Result<Value, ConfigError>;
 
 /// Ordered list of migration functions. Each entry migrates from version N to N+1,
 /// where N is the index into this slice (0-based, so index 0 = v1→v2, etc.).
-pub const MIGRATIONS: &[MigrationFn] = &[migrate_v1_to_v2, migrate_v2_to_v3, migrate_v3_to_v4, migrate_v4_to_v5, migrate_v5_to_v6, migrate_v6_to_v7, migrate_v7_to_v8];
+pub const MIGRATIONS: &[MigrationFn] = &[migrate_v1_to_v2, migrate_v2_to_v3, migrate_v3_to_v4, migrate_v4_to_v5, migrate_v5_to_v6, migrate_v6_to_v7, migrate_v7_to_v8, migrate_v8_to_v9];
 
 /// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —
 /// `serde(default)` already handles missing fields on deserialize, but we
@@ -109,6 +109,20 @@ fn migrate_v7_to_v8(mut value: Value) -> Result<Value, ConfigError> {
     if let Value::Object(ref mut obj) = value {
         obj.entry("repo_generations".to_string())
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    }
+    Ok(value)
+}
+
+/// v8→v9: introduce `purchased_plans` (Vec<PurchasedPlan>). Defaults to an empty
+/// array. Plans used to live in browser localStorage, which lost them whenever
+/// the UI was opened from a different browser/machine; persisting them in
+/// settings.json (next to the proxy keys they reference) makes them follow the
+/// install. The UI folds any pre-existing localStorage plans into this list on
+/// first load after the upgrade, so nothing already claimed is dropped.
+fn migrate_v8_to_v9(mut value: Value) -> Result<Value, ConfigError> {
+    if let Value::Object(ref mut obj) = value {
+        obj.entry("purchased_plans".to_string())
+            .or_insert_with(|| Value::Array(vec![]));
     }
     Ok(value)
 }
@@ -264,6 +278,44 @@ fn default_enabled_mcp_tools() -> Vec<String> {
     ]
 }
 
+/// A plan/key the user has bought (or claimed as a free trial) through the buy
+/// flow. Persisted in settings.json (was browser localStorage) so the list
+/// follows the install across browsers/machines instead of being lost on a new
+/// device. Identity for dedup is `proxy_key` (the same key can be re-claimed
+/// under multiple invoices, e.g. renewals, but is one plan sharing one budget
+/// pool); `invoice` is the display/lookup fallback when no key is present.
+///
+/// Live budget/remaining is NOT stored here — the UI fetches it fresh from
+/// `/api/plan/usage` per key — so this struct only carries identity + display
+/// metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PurchasedPlan {
+    /// Invoice / order number. Identity fallback and lookup key when `proxy_key`
+    /// is absent; also shown as the plan title when `package_name` is empty.
+    pub invoice: String,
+    /// The proxy API key granted by this plan. Primary dedup identity. May be
+    /// empty only for malformed legacy entries.
+    #[serde(default)]
+    pub proxy_key: String,
+    /// Base URL the key authenticates against (proxy endpoint).
+    #[serde(default)]
+    pub base_url: String,
+    /// Human-readable package name for display (e.g. "5 Beer", "Basic").
+    #[serde(default)]
+    pub package_name: String,
+    /// Unix epoch milliseconds when the plan was added locally. Display only.
+    #[serde(default)]
+    pub purchased_at: Option<i64>,
+    /// Unix epoch milliseconds of expiry, or null for non-expiring plans. Synced
+    /// from the server's authoritative value on each usage fetch.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    /// True for free-trial keys — drives the dedicated "expired, buy a plan"
+    /// badge in the UI. Defaults to false for paid plans.
+    #[serde(default)]
+    pub is_free_trial: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     /// Schema version. Server always stamps CURRENT_VERSION on write.
@@ -362,6 +414,12 @@ pub struct Settings {
     /// never see empty.
     #[serde(default)]
     pub machine_id: Option<String>,
+    /// Plans/keys the user has bought or claimed, persisted here (was browser
+    /// localStorage) so they follow the install across browsers/machines.
+    /// CLIENT-OWNED: the UI reads, mutates, and PUTs this list like `repos`;
+    /// the server round-trips it verbatim. Deduped by `proxy_key` in the UI.
+    #[serde(default)]
+    pub purchased_plans: Vec<PurchasedPlan>,
 }
 
 /// Salt mixed into the machine-id hash. A fixed compile-in constant: it must
@@ -387,6 +445,7 @@ impl Default for Settings {
             index_ignore_filenames: default_index_ignore_filenames(),
             repo_generations: HashMap::new(),
             machine_id: None,
+            purchased_plans: Vec::new(),
         }
     }
 }
@@ -1121,6 +1180,89 @@ mod tests {
             "on-disk repo_generations should be an explicit object after migration, got: {:?}",
             v.get("repo_generations")
         );
+    }
+
+    #[test]
+    fn test_v8_to_v9_migration_stamps_empty_purchased_plans() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        // A v8 file has no `purchased_plans` key. After migration it must read as
+        // an empty list (no plans invented) and the on-disk file must carry an
+        // explicit array so an older binary trips VersionTooNew rather than
+        // silently dropping the field on its next save.
+        let v8 = r#"{
+            "version": 8,
+            "repos": [],
+            "embedding": {"provider":"voyage","model":"voyage-4-lite","api_keys":[],"embed_concurrency":16,"voyage_base_url":null},
+            "llm": {"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]},
+            "data_dir": null,
+            "embeddings_dir": null,
+            "enabled_mcp_tools": ["codebase-retrieval","file-retrieval"],
+            "custom_extensions": [],
+            "index_ignore_filenames": ["CLAUDE.md","AGENTS.md"],
+            "repo_generations": {}
+        }"#;
+        fs::write(&path, v8).expect("write v8 settings.json");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load v8");
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert!(
+            loaded.purchased_plans.is_empty(),
+            "purchased_plans must default to empty after v8→v9 migration"
+        );
+
+        let raw = fs::read_to_string(&path).expect("re-read");
+        let v: Value = serde_json::from_str(&raw).expect("parse re-read");
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(CURRENT_VERSION as u64));
+        assert!(
+            v.get("purchased_plans").map(|x| x.is_array()).unwrap_or(false),
+            "on-disk purchased_plans should be an explicit array after migration, got: {:?}",
+            v.get("purchased_plans")
+        );
+    }
+
+    /// A purchased plan round-trips through atomic write + migration-aware load
+    /// using the real persistence path the server uses on every PUT /api/config.
+    #[test]
+    fn test_purchased_plans_round_trip() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let s = Settings {
+            purchased_plans: vec![PurchasedPlan {
+                invoice: "PKG_123".to_owned(),
+                proxy_key: "key-abc".to_owned(),
+                base_url: "https://example/v1".to_owned(),
+                package_name: "5 Beer".to_owned(),
+                purchased_at: Some(1_700_000_000_000),
+                expires_at: Some(1_710_000_000_000),
+                is_free_trial: false,
+            }],
+            ..Settings::default()
+        };
+        write_settings_atomic(&path, &s).expect("write");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load");
+        assert_eq!(loaded.purchased_plans, s.purchased_plans);
+        assert_eq!(loaded.version, CURRENT_VERSION);
+    }
+
+    /// A minimal plan object (only the required `invoice`) deserializes cleanly
+    /// with every optional field defaulted — the additive `#[serde(default)]`
+    /// contract the UI relies on when reading older/sparser entries.
+    #[test]
+    fn test_purchased_plan_deserializes_minimal() {
+        let plan_json = r#"{"invoice":"PKG_1","proxy_key":"k"}"#;
+        let p: PurchasedPlan = serde_json::from_str(plan_json).expect("deserialize minimal plan");
+        assert_eq!(p.invoice, "PKG_1");
+        assert_eq!(p.proxy_key, "k");
+        assert!(p.base_url.is_empty());
+        assert!(p.purchased_at.is_none());
+        assert!(p.expires_at.is_none());
+        assert!(!p.is_free_trial);
     }
 
     #[test]
