@@ -21,7 +21,13 @@ use crate::store::schema::SCHEMA_DDL;
 ///      (which writes parent as a plain string) is not rejected by an existing
 ///      SCHEMAFULL symbol.parent definition (older DBs declared it as
 ///      option<record<symbol>>, which silently rolled back the whole batch → 0 symbols).
-pub const DB_SCHEMA_VERSION: u32 = 5;
+/// v5 = chunk.embedding packed from array<float> → bytes (8.9× faster insert).
+/// v6 = calls flipped from TYPE RELATION → TYPE NORMAL. Nothing traverses the
+///      graph at v5+; all reads use denormalized columns. RELATION forced
+///      graph-adjacency writes on every edge (~44% of Phase-2 write time on the
+///      kernel). The migration clears old RELATION rows so they re-resolve as
+///      plain rows. Output (call-graph nodes/edges) is byte-identical.
+pub const DB_SCHEMA_VERSION: u32 = 6;
 
 /// key in index_meta for the DB schema version.
 pub const DB_SCHEMA_VERSION_KEY: &str = "db_schema_version";
@@ -219,6 +225,9 @@ pub fn maybe_spawn_migration(repo_dbs: RepoDbMap, repo: String, stored_version: 
             }
             if stored_version < 5 {
                 run_migration_v4_to_v5(&db).await.context("v4→v5")?;
+            }
+            if stored_version < 6 {
+                run_migration_v5_to_v6(&db).await.context("v5→v6")?;
             }
             Ok(())
         }
@@ -660,6 +669,57 @@ pub async fn run_migration_v4_to_v5(db: &Surreal<Db>) -> Result<()> {
         .context("migration v4→v5: stamp db_schema_version=5")?;
 
     info!("migration v4→v5 complete");
+    Ok(())
+}
+
+/// v5→v6: convert the `calls` table from a graph RELATION to a NORMAL table.
+///
+/// WHY: at v5+ no code traverses the call graph (`->calls->` / `<-calls<-`).
+/// Every read path — query_callers/query_callees (graph_expand.rs) and call_graph
+/// (ops.rs) — reads the denormalized in_name/out_name/in_file/out_file columns via
+/// their secondary indexes. The RELATION type forced SurrealDB to maintain
+/// graph-adjacency keys on every edge insert; on the Linux kernel (4.44M edges)
+/// that was ~44% of Phase-2 edge-write time, for data nothing reads.
+///
+/// The table TYPE flip itself is done by `DEFINE TABLE OVERWRITE calls TYPE NORMAL`
+/// in SCHEMA_DDL (applied synchronously on every open_db, before any write). This
+/// migration only clears the OLD rows that were written as RELATION records, so
+/// they are re-resolved as plain rows on the next index run.
+///
+/// Recovery model (matches the Phase-2 crash-recovery branch in pipeline.rs::run):
+/// `DELETE FROM calls` drops stale RELATION rows; deleting the `edges_resolved`
+/// marker forces Phase-2 re-resolution on the next run. The raw_edge table
+/// (incremental path) or a full rebuild (RAM path) then repopulates calls.
+/// Idempotent: re-running deletes an already-empty table and re-clears the marker
+/// — both no-ops in effect.
+///
+/// Output invariance: verified on notepad-ade — the call-graph node/edge digest is
+/// byte-identical before and after (RELATION vs NORMAL), since the read columns are
+/// unchanged.
+pub async fn run_migration_v5_to_v6(db: &Surreal<Db>) -> Result<()> {
+    info!("migration v5→v6: converting calls RELATION → NORMAL (clearing stale edge rows)");
+
+    // Drop all existing calls rows (written as RELATION records). They will be
+    // re-resolved as plain NORMAL rows by Phase 2 on the next index trigger.
+    db.query("DELETE FROM calls")
+        .await
+        .context("migration v5→v6: delete calls")?;
+
+    // Clear the edges_resolved marker so Phase 2 re-runs. On the next open with no
+    // file changes, run()'s "edges_resolved marker absent" branch replays Phase 2
+    // from raw_edge (incremental DBs) or forces a full rebuild (RAM-path DBs whose
+    // raw_edge table is empty) — the same self-healing path used after a crash.
+    let _ = db
+        .query("DELETE FROM index_meta WHERE key = $k")
+        .bind(("k", "edges_resolved"))
+        .await;
+
+    // Stamp version ONLY after both deletes complete.
+    ops::set_meta(db, DB_SCHEMA_VERSION_KEY, "6")
+        .await
+        .context("migration v5→v6: stamp db_schema_version=6")?;
+
+    info!("migration v5→v6 complete");
     Ok(())
 }
 
@@ -1557,6 +1617,67 @@ mod stale_schema {
             after,
             before,
             "DEFINE TABLE IF NOT EXISTS must not drop existing rows (before={before}, after={after})"
+        );
+    }
+
+    /// v5→v6 regression: a `calls` table created as a graph RELATION (old schema)
+    /// must be flippable to a NORMAL table by the current SCHEMA_DDL, and plain
+    /// INSERTs must succeed afterward. This pins the riskiest part of the
+    /// RELATION→NORMAL conversion: that `DEFINE TABLE OVERWRITE ... TYPE NORMAL`
+    /// against a POPULATED relation table does not error, and that the post-flip
+    /// write path (`INSERT INTO calls`, used by flush_edge_batch) works.
+    #[tokio::test]
+    async fn calls_relation_table_flips_to_normal_and_accepts_plain_insert() {
+        use serde::Deserialize;
+        let home = TempDir::new().unwrap();
+        let db = open_raw_db(home.path(), "calls_flip").await;
+
+        // Old-world: calls is a graph RELATION with two symbol endpoints + one
+        // RELATE edge, exactly as a pre-v6 DB would have persisted it.
+        db.query(
+            "DEFINE TABLE IF NOT EXISTS calls TYPE RELATION IN symbol OUT symbol;\
+             CREATE symbol:`⟨/a.rs::foo⟩` SET name='foo', file='/a.rs';\
+             CREATE symbol:`⟨/b.rs::bar⟩` SET name='bar', file='/b.rs';\
+             RELATE symbol:`⟨/a.rs::foo⟩`->calls->symbol:`⟨/b.rs::bar⟩` \
+               SET line=1, in_file='/a.rs', out_file='/b.rs', \
+                   in_name='/a.rs::foo', out_name='/b.rs::bar';",
+        )
+        .await
+        .expect("relation setup")
+        .check()
+        .expect("relation setup check");
+
+        // Re-apply current SCHEMA_DDL: flips calls to TYPE NORMAL via OVERWRITE.
+        // Must NOT error against the populated relation table.
+        db.query(SCHEMA_DDL)
+            .await
+            .expect("re-apply DDL flips calls to NORMAL")
+            .check()
+            .expect("re-apply DDL check");
+
+        // Post-flip: a plain INSERT (the flush_edge_batch write path) must work.
+        db.query(
+            "INSERT INTO calls { in: symbol:`⟨/a.rs::foo⟩`, out: symbol:`⟨/b.rs::bar⟩`, \
+             line: 2, in_file: '/a.rs', out_file: '/b.rs', \
+             in_name: '/a.rs::foo', out_name: '/b.rs::bar' }",
+        )
+        .await
+        .expect("plain INSERT into NORMAL calls")
+        .check()
+        .expect("plain INSERT check");
+
+        // The denormalized read path (WHERE out_name = ...) must still resolve.
+        #[derive(Deserialize)]
+        struct Row { in_name: Option<String> }
+        let rows: Vec<Row> = db
+            .query("SELECT in_name FROM calls WHERE out_name = '/b.rs::bar'")
+            .await
+            .expect("read by out_name")
+            .take(0)
+            .expect("take rows");
+        assert!(
+            rows.iter().any(|r| r.in_name.as_deref() == Some("/a.rs::foo")),
+            "denormalized in_name/out_name read must work on NORMAL calls table"
         );
     }
 }

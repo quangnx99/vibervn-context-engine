@@ -1311,8 +1311,9 @@ mod call_graph_tests {
     }
 
     async fn insert_call(db: &Surreal<Db>, from_fqn: &str, to_fqn: &str) {
+        // calls is a NORMAL table (schema v6+) — plain INSERT, no RELATION.
         db.query(format!(
-            "INSERT RELATION INTO calls {{ in: symbol:`⟨{from_fqn}⟩`, out: symbol:`⟨{to_fqn}⟩`, \
+            "INSERT INTO calls {{ in: symbol:`⟨{from_fqn}⟩`, out: symbol:`⟨{to_fqn}⟩`, \
              line: 1, in_file: 'f', out_file: 'f', in_name: '{from_fqn}', out_name: '{to_fqn}' }}"
         ))
         .await
@@ -1394,7 +1395,7 @@ mod call_graph_tests {
         }
         for line in 1..=5 {
             db.query(format!(
-                "INSERT RELATION INTO calls {{ in: symbol:`⟨/a.cpp::caller⟩`, \
+                "INSERT INTO calls {{ in: symbol:`⟨/a.cpp::caller⟩`, \
                  out: symbol:`⟨/a.cpp::callee⟩`, line: {line}, in_file: 'f', out_file: 'f', \
                  in_name: '/a.cpp::caller', out_name: '/a.cpp::callee' }}"
             ))

@@ -155,6 +155,20 @@ impl std::fmt::Display for PipelineAbort {
 
 impl std::error::Error for PipelineAbort {}
 
+/// Sub-term breakdown for Phase 2 (edge resolution), surfaced into
+/// `IndexPipelineStats` so a single "PERF SUMMARY phase2" line attributes the
+/// Phase-2 wall time to load / bucket-build / resolve / write / index steps.
+#[derive(Default, Debug)]
+pub struct Phase2Stats {
+    pub sym_load_ms: u64,
+    pub bucket_build_ms: u64,
+    pub resolve_cpu_ms: u64,
+    pub relate_write_ms: u64,
+    pub idx_drop_ms: u64,
+    pub idx_rebuild_ms: u64,
+    pub edges_written: u64,
+}
+
 #[derive(Default)]
 pub struct IndexPipelineStats {
     pub indexed_files: u64,
@@ -196,6 +210,26 @@ pub struct IndexPipelineStats {
     /// are durable (full rebuild only, ms). One-shot bulk build that replaces ~6.2M
     /// per-row incremental index updates. 0 on the incremental path.
     pub stage3_sym_idx_rebuild_ms: u64,
+
+    // ─── Phase-2 sub-term breakdown (edge resolution) ────────────────────────
+    // These attribute the Phase-2 wall time (`phase2_ms`) to its constituent
+    // steps so the bottleneck is visible in one greppable "PERF SUMMARY phase2"
+    // line. Populated by both resolve_edges_from_ram (RAM fast path, the path
+    // kernel-scale repos take) and resolve_edges_phase2 (DB-scan overflow path).
+    /// Time loading all symbols from the DB into RAM (ms).
+    pub phase2_sym_load_ms: u64,
+    /// Time building+sorting the name→candidates bucket map (ms).
+    pub phase2_bucket_build_ms: u64,
+    /// CPU time resolving raw edges against the symbol map (ms). Excludes DB writes.
+    pub phase2_resolve_cpu_ms: u64,
+    /// Time in `INSERT RELATION INTO calls` flushes (ms).
+    pub phase2_relate_write_ms: u64,
+    /// Time dropping the 4 calls indexes before bulk RELATE (ms).
+    pub phase2_idx_drop_ms: u64,
+    /// Time rebuilding the 4 calls indexes after bulk RELATE (ms).
+    pub phase2_idx_rebuild_ms: u64,
+    /// Number of resolved `calls` edges written.
+    pub phase2_edges_written: u64,
 }
 
 /// Key used to track whether Phase 2 (raw edge resolution) has completed.
@@ -394,6 +428,13 @@ impl IndexPipeline {
                 stage3_sym_idx_rebuild_ms = stage_stats.stage3_sym_idx_rebuild_ms,
                 stage3_filemeta_ms = stage_stats.stage3_filemeta_ms,
                 phase2_ms = stage_stats.phase2_ms,
+                phase2_sym_load_ms = stage_stats.phase2_sym_load_ms,
+                phase2_bucket_build_ms = stage_stats.phase2_bucket_build_ms,
+                phase2_resolve_cpu_ms = stage_stats.phase2_resolve_cpu_ms,
+                phase2_relate_write_ms = stage_stats.phase2_relate_write_ms,
+                phase2_idx_drop_ms = stage_stats.phase2_idx_drop_ms,
+                phase2_idx_rebuild_ms = stage_stats.phase2_idx_rebuild_ms,
+                phase2_edges_written = stage_stats.phase2_edges_written,
                 embed_total_ms = stage_stats.embed_total_ms,
                 cache_hit_chunks = stage_stats.cache_hit_chunks,
                 cache_miss_chunks = stage_stats.cache_miss_chunks,
@@ -424,6 +465,13 @@ impl IndexPipeline {
                 stage3_chunk_idx_rebuild_ms: stage_stats.stage3_chunk_idx_rebuild_ms,
                 stage3_sym_idx_drop_ms: stage_stats.stage3_sym_idx_drop_ms,
                 stage3_sym_idx_rebuild_ms: stage_stats.stage3_sym_idx_rebuild_ms,
+                phase2_sym_load_ms: stage_stats.phase2_sym_load_ms,
+                phase2_bucket_build_ms: stage_stats.phase2_bucket_build_ms,
+                phase2_resolve_cpu_ms: stage_stats.phase2_resolve_cpu_ms,
+                phase2_relate_write_ms: stage_stats.phase2_relate_write_ms,
+                phase2_idx_drop_ms: stage_stats.phase2_idx_drop_ms,
+                phase2_idx_rebuild_ms: stage_stats.phase2_idx_rebuild_ms,
+                phase2_edges_written: stage_stats.phase2_edges_written,
             });
         }
 
@@ -509,6 +557,7 @@ impl IndexPipeline {
                     info!(repo = %self.repo, raw_edge_total, "edges_resolved marker absent — replaying Phase 2 from DB");
                     self.resolve_edges_phase2(db, cancel_token.as_ref()).await
                         .context("edges Phase 2 replay on no-change run")?;
+                    // (replay path discards Phase2Stats — no aggregate stats returned here)
                 }
             }
             let indexed = stored_meta.len() as u64;
@@ -586,19 +635,26 @@ impl IndexPipeline {
             bus.emit(IndexEvent::Phase2Start { repo: self.repo.clone() });
         }
         let phase2_start = Instant::now();
-        if !ram_edges_overflowed && !ram_raw_edges.is_empty() {
+        let p2: Phase2Stats = if !ram_edges_overflowed && !ram_raw_edges.is_empty() {
             // Fast path: all raw_edges are in RAM — skip DB scan entirely.
             self.resolve_edges_from_ram(db, ram_raw_edges, cancel_token)
                 .await
-                .context("full_rebuild: resolve_edges_from_ram")?;
+                .context("full_rebuild: resolve_edges_from_ram")?
         } else {
             // DB path: overflow or incremental — use keyset scan as before.
             self.resolve_edges_phase2(db, cancel_token)
                 .await
-                .context("full_rebuild: resolve_edges_phase2")?;
-        }
+                .context("full_rebuild: resolve_edges_phase2")?
+        };
         let phase2_ms = phase2_start.elapsed().as_millis() as u64;
         stats.phase2_ms = phase2_ms;
+        stats.phase2_sym_load_ms = p2.sym_load_ms;
+        stats.phase2_bucket_build_ms = p2.bucket_build_ms;
+        stats.phase2_resolve_cpu_ms = p2.resolve_cpu_ms;
+        stats.phase2_relate_write_ms = p2.relate_write_ms;
+        stats.phase2_idx_drop_ms = p2.idx_drop_ms;
+        stats.phase2_idx_rebuild_ms = p2.idx_rebuild_ms;
+        stats.phase2_edges_written = p2.edges_written;
         if let Some(bus) = event_bus {
             bus.emit(IndexEvent::Phase2Done {
                 repo: self.repo.clone(),
@@ -1442,6 +1498,8 @@ impl IndexPipeline {
             stage3_chunk_idx_rebuild_ms: 0,
             stage3_sym_idx_drop_ms: sym_idx_drop_ms,
             stage3_sym_idx_rebuild_ms: sym_idx_rebuild_ms,
+            // Phase-2 sub-terms are filled in by full_rebuild after Phase 2 runs.
+            ..Default::default()
         };
 
         Ok((all_chunk_vectors, stats, ram_raw_edges, ram_edges_overflowed))
@@ -1623,8 +1681,9 @@ impl IndexPipeline {
     /// the index seek and achieves O(N) total.
     ///
     /// Writes the `edges_resolved` marker in `index_meta` only after all pages commit.
-    async fn resolve_edges_phase2(&self, db: &Surreal<Db>, cancel_token: Option<&CancellationToken>) -> Result<()> {
+    async fn resolve_edges_phase2(&self, db: &Surreal<Db>, cancel_token: Option<&CancellationToken>) -> Result<Phase2Stats> {
         use serde::Deserialize;
+        let mut p2 = Phase2Stats::default();
 
         // First delete all existing calls edges (we're rewriting them from raw_edge).
         db.query("DELETE FROM calls").await.context("phase2: delete calls")?;
@@ -1643,7 +1702,7 @@ impl IndexPipeline {
             set_meta(db, EDGES_RESOLVED_KEY, "1")
                 .await
                 .context("phase2: set edges_resolved marker (empty)")?;
-            return Ok(());
+            return Ok(p2);
         }
 
         // Load ALL symbols into memory at once for O(1) per-edge lookup.
@@ -1651,10 +1710,11 @@ impl IndexPipeline {
         // Memory: 27K symbols × ~120 bytes = ~3.3 MB — bounded and safe.
         let t_sym_load = Instant::now();
         let all_symbols = load_all_symbols(db).await.context("phase2: load all symbols")?;
-        let sym_load_ms = t_sym_load.elapsed().as_millis();
-        info!(repo = %self.repo, symbol_count = all_symbols.len(), sym_load_ms, "phase2: loaded all symbols");
+        p2.sym_load_ms = t_sym_load.elapsed().as_millis() as u64;
+        info!(repo = %self.repo, symbol_count = all_symbols.len(), sym_load_ms = p2.sym_load_ms, "phase2: loaded all symbols");
 
         // Build a name → Vec<SymbolWithPos> lookup map for O(1) resolution.
+        let t_bucket = Instant::now();
         let mut name_bucket: HashMap<String, Vec<SymbolWithPos>> = HashMap::new();
         for s in all_symbols {
             name_bucket.entry(s.name.clone()).or_default().push(s);
@@ -1667,6 +1727,7 @@ impl IndexPipeline {
                     .then(a.line_end.cmp(&b.line_end))
             });
         }
+        p2.bucket_build_ms = t_bucket.elapsed().as_millis() as u64;
 
         // Drop all 4 calls indexes before the bulk RELATE flush to eliminate per-insert
         // index maintenance overhead (~4 index updates × 77K rows). Rebuild synchronously
@@ -1679,7 +1740,8 @@ impl IndexPipeline {
              REMOVE INDEX IF EXISTS idx_calls_in_name  ON calls; \
              REMOVE INDEX IF EXISTS idx_calls_out_name ON calls;"
         ).await.context("phase2: drop calls indexes")?;
-        info!(repo = %self.repo, idx_drop_ms = t_idx_drop.elapsed().as_millis() as u64, "phase2: dropped calls indexes");
+        p2.idx_drop_ms = t_idx_drop.elapsed().as_millis() as u64;
+        info!(repo = %self.repo, idx_drop_ms = p2.idx_drop_ms, "phase2: dropped calls indexes");
 
         // Stream raw_edge in O(N) passes via file-keyset pagination.
         //
@@ -1786,9 +1848,12 @@ impl IndexPipeline {
             // Uses EDGE_RELATE_BATCH_SIZE (larger than WRITE_BATCH_SIZE) because
             // RELATE statements are compact and fewer round-trips = faster on-disk writes.
             if edge_batch.len() >= EDGE_RELATE_BATCH_SIZE {
+                let t_write = Instant::now();
+                p2.edges_written += edge_batch.len() as u64;
                 flush_edge_batch(db, &edge_batch)
                     .await
                     .context("phase2: flush edge batch")?;
+                p2.relate_write_ms += t_write.elapsed().as_millis() as u64;
                 edge_batch.clear();
             }
 
@@ -1798,6 +1863,7 @@ impl IndexPipeline {
             //  but we can also break early here for clarity.)
         }
 
+        p2.resolve_cpu_ms = resolve_ms_total;
         let load_elapsed_ms = t_load_start.elapsed().as_millis() as u64;
         info!(
             repo = %self.repo,
@@ -1811,10 +1877,12 @@ impl IndexPipeline {
         // Flush any remaining edges.
         let t_flush_tail = Instant::now();
         if !edge_batch.is_empty() {
+            p2.edges_written += edge_batch.len() as u64;
             flush_edge_batch(db, &edge_batch)
                 .await
                 .context("phase2: flush tail edge batch")?;
         }
+        p2.relate_write_ms += t_flush_tail.elapsed().as_millis() as u64;
         info!(repo = %self.repo, flush_tail_ms = t_flush_tail.elapsed().as_millis() as u64, "phase2: tail flush complete");
 
         // Rebuild calls indexes synchronously after all bulk RELATEs are committed.
@@ -1828,16 +1896,27 @@ impl IndexPipeline {
              DEFINE INDEX IF NOT EXISTS idx_calls_in_name  ON calls FIELDS in_name; \
              DEFINE INDEX IF NOT EXISTS idx_calls_out_name ON calls FIELDS out_name;"
         ).await.context("phase2: rebuild calls indexes")?;
-        let idx_rebuild_ms = t_idx_rebuild.elapsed().as_millis() as u64;
-        info!(repo = %self.repo, idx_rebuild_ms, "phase2: rebuilt calls indexes synchronously");
+        p2.idx_rebuild_ms = t_idx_rebuild.elapsed().as_millis() as u64;
+        info!(repo = %self.repo, idx_rebuild_ms = p2.idx_rebuild_ms, "phase2: rebuilt calls indexes synchronously");
 
         // Stamp the edges_resolved marker ONLY after all pages commit AND indexes rebuild.
         set_meta(db, EDGES_RESOLVED_KEY, "1")
             .await
             .context("phase2: set edges_resolved marker")?;
 
-        info!(repo = %self.repo, "Phase 2 edge resolution complete");
-        Ok(())
+        info!(
+            repo = %self.repo,
+            edges_written = p2.edges_written,
+            sym_load_ms = p2.sym_load_ms,
+            bucket_build_ms = p2.bucket_build_ms,
+            scan_ms_total,
+            resolve_cpu_ms = p2.resolve_cpu_ms,
+            relate_write_ms = p2.relate_write_ms,
+            idx_drop_ms = p2.idx_drop_ms,
+            idx_rebuild_ms = p2.idx_rebuild_ms,
+            "PERF SUMMARY phase2(db-scan)"
+        );
+        Ok(p2)
     }
 
     // ─── RAM-path Phase 2: resolve pre-buffered edges without DB scan ─────
@@ -1869,7 +1948,8 @@ impl IndexPipeline {
         db: &Surreal<Db>,
         raw_edges: Vec<RawEdgeRecord>,
         cancel_token: Option<&CancellationToken>,
-    ) -> Result<()> {
+    ) -> Result<Phase2Stats> {
+        let mut p2 = Phase2Stats::default();
         let total = raw_edges.len();
         info!(repo = %self.repo, total_raw_edges = total, "phase2(ram): starting in-RAM edge resolution");
 
@@ -1877,16 +1957,18 @@ impl IndexPipeline {
             set_meta(db, EDGES_RESOLVED_KEY, "1")
                 .await
                 .context("phase2(ram): set edges_resolved marker (empty)")?;
-            return Ok(());
+            return Ok(p2);
         }
 
         // Load ALL symbols into memory at once — same as the DB-scan Phase 2 path.
         let t_sym_load = Instant::now();
         let all_symbols = load_all_symbols(db).await.context("phase2(ram): load all symbols")?;
         let sym_load_ms = t_sym_load.elapsed().as_millis();
+        p2.sym_load_ms = sym_load_ms as u64;
         info!(repo = %self.repo, symbol_count = all_symbols.len(), sym_load_ms, "phase2(ram): loaded all symbols");
 
         // Build name → Vec<SymbolWithPos> map for O(1) resolution.
+        let t_bucket = Instant::now();
         let mut name_bucket: HashMap<String, Vec<SymbolWithPos>> = HashMap::new();
         for s in all_symbols {
             name_bucket.entry(s.name.clone()).or_default().push(s);
@@ -1898,6 +1980,7 @@ impl IndexPipeline {
                     .then(a.line_end.cmp(&b.line_end))
             });
         }
+        p2.bucket_build_ms = t_bucket.elapsed().as_millis() as u64;
 
         // Drop calls indexes before bulk RELATE.
         let t_idx_drop = Instant::now();
@@ -1907,12 +1990,14 @@ impl IndexPipeline {
              REMOVE INDEX IF EXISTS idx_calls_in_name  ON calls; \
              REMOVE INDEX IF EXISTS idx_calls_out_name ON calls;"
         ).await.context("phase2(ram): drop calls indexes")?;
-        info!(repo = %self.repo, idx_drop_ms = t_idx_drop.elapsed().as_millis() as u64, "phase2(ram): dropped calls indexes");
+        p2.idx_drop_ms = t_idx_drop.elapsed().as_millis() as u64;
+        info!(repo = %self.repo, idx_drop_ms = p2.idx_drop_ms, "phase2(ram): dropped calls indexes");
 
         // Resolve all RAM-buffered raw_edges in one pass (no DB scan needed).
         let t_resolve = Instant::now();
         let mut edge_batch: Vec<(String, String, i64, String, String, String, String)> = Vec::new();
         let mut relate_write_ms: u64 = 0;
+        let mut edges_written: u64 = 0;
 
         for (i, re) in raw_edges.iter().enumerate() {
             // Cancellation check every EDGE_RELATE_BATCH_SIZE edges (cheap, bounded
@@ -1953,6 +2038,7 @@ impl IndexPipeline {
 
             if edge_batch.len() >= EDGE_RELATE_BATCH_SIZE {
                 let t_write = Instant::now();
+                edges_written += edge_batch.len() as u64;
                 flush_edge_batch(db, &edge_batch)
                     .await
                     .context("phase2(ram): flush edge batch")?;
@@ -1960,17 +2046,22 @@ impl IndexPipeline {
                 edge_batch.clear();
             }
         }
-        let resolve_ms = t_resolve.elapsed().as_millis() as u64;
-        info!(repo = %self.repo, resolve_ms, "phase2(ram): in-memory resolution complete");
+        // resolve_cpu = whole loop minus the time spent inside flush calls.
+        let resolve_ms = (t_resolve.elapsed().as_millis() as u64).saturating_sub(relate_write_ms);
+        p2.resolve_cpu_ms = resolve_ms;
+        info!(repo = %self.repo, resolve_cpu_ms = resolve_ms, "phase2(ram): in-memory resolution complete");
 
         // Flush tail.
         if !edge_batch.is_empty() {
             let t_write = Instant::now();
+            edges_written += edge_batch.len() as u64;
             flush_edge_batch(db, &edge_batch)
                 .await
                 .context("phase2(ram): flush tail edge batch")?;
             relate_write_ms += t_write.elapsed().as_millis() as u64;
         }
+        p2.relate_write_ms = relate_write_ms;
+        p2.edges_written = edges_written;
 
         // Rebuild calls indexes synchronously (same as DB-scan Phase 2).
         let t_idx_rebuild = Instant::now();
@@ -1980,16 +2071,26 @@ impl IndexPipeline {
              DEFINE INDEX IF NOT EXISTS idx_calls_in_name  ON calls FIELDS in_name; \
              DEFINE INDEX IF NOT EXISTS idx_calls_out_name ON calls FIELDS out_name;"
         ).await.context("phase2(ram): rebuild calls indexes")?;
-        let idx_rebuild_ms = t_idx_rebuild.elapsed().as_millis() as u64;
-        info!(repo = %self.repo, idx_rebuild_ms, relate_write_ms, "phase2(ram): rebuilt calls indexes synchronously");
+        p2.idx_rebuild_ms = t_idx_rebuild.elapsed().as_millis() as u64;
+        info!(repo = %self.repo, idx_rebuild_ms = p2.idx_rebuild_ms, relate_write_ms, "phase2(ram): rebuilt calls indexes synchronously");
 
         // Stamp edges_resolved marker.
         set_meta(db, EDGES_RESOLVED_KEY, "1")
             .await
             .context("phase2(ram): set edges_resolved marker")?;
 
-        info!(repo = %self.repo, "phase2(ram): edge resolution complete");
-        Ok(())
+        info!(
+            repo = %self.repo,
+            edges_written = p2.edges_written,
+            sym_load_ms = p2.sym_load_ms,
+            bucket_build_ms = p2.bucket_build_ms,
+            resolve_cpu_ms = p2.resolve_cpu_ms,
+            relate_write_ms = p2.relate_write_ms,
+            idx_drop_ms = p2.idx_drop_ms,
+            idx_rebuild_ms = p2.idx_rebuild_ms,
+            "PERF SUMMARY phase2(ram)"
+        );
+        Ok(p2)
     }
 
     // ─── Incremental Phase 2: scoped edge resolution ──────────────────────
@@ -2896,10 +2997,13 @@ async fn flush_edge_batch(
 
     let data = SqlArray::from(records);
 
-    db.query("INSERT RELATION INTO calls $data")
+    // calls is a NORMAL table (schema v6+): graph-adjacency keys are not written,
+    // so a plain INSERT is ~45% cheaper per edge than INSERT RELATION while every
+    // v5+ read path (denormalized in_name/out_name/in_file/out_file) is unchanged.
+    db.query("INSERT INTO calls $data")
         .bind(("data", data))
         .await
-        .context("flush_edge_batch: INSERT RELATION")?;
+        .context("flush_edge_batch: INSERT")?;
 
     Ok(())
 }
@@ -3842,16 +3946,18 @@ mod per_edge_backfill_tests {
             .unwrap();
         }
 
-        // Create two RELATE edges WITHOUT in_name/out_name (v1 state).
-        // Both share in_file=/a.rs and out_file=/b.rs.
+        // Create two edges WITHOUT in_name/out_name (v1 state). Both share
+        // in_file=/a.rs and out_file=/b.rs. calls is a NORMAL table (v6+), so we
+        // INSERT plain rows; `in`/`out` are stored as record links so the v1→v2
+        // backfill's `in.name`/`out.name` deref still resolves.
         db.query(
-            "RELATE symbol:`⟨/a.rs::foo⟩`->calls->symbol:`⟨/b.rs::baz⟩` \
-             SET line = 1, in_file = '/a.rs', out_file = '/b.rs'"
+            "INSERT INTO calls { in: symbol:`⟨/a.rs::foo⟩`, out: symbol:`⟨/b.rs::baz⟩`, \
+             line: 1, in_file: '/a.rs', out_file: '/b.rs' }"
         ).await.unwrap();
 
         db.query(
-            "RELATE symbol:`⟨/a.rs::bar⟩`->calls->symbol:`⟨/b.rs::qux⟩` \
-             SET line = 2, in_file = '/a.rs', out_file = '/b.rs'"
+            "INSERT INTO calls { in: symbol:`⟨/a.rs::bar⟩`, out: symbol:`⟨/b.rs::qux⟩`, \
+             line: 2, in_file: '/a.rs', out_file: '/b.rs' }"
         ).await.unwrap();
 
         // Verify pre-migration state: in_name IS NONE on both.

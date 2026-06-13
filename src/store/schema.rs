@@ -48,7 +48,19 @@ DEFINE INDEX IF NOT EXISTS idx_symbol_name ON symbol FIELDS name;
 DEFINE TABLE IF NOT EXISTS chunk SCHEMALESS;
 DEFINE INDEX IF NOT EXISTS idx_chunk_file ON chunk FIELDS file;
 
-DEFINE TABLE IF NOT EXISTS calls TYPE RELATION IN symbol OUT symbol;
+-- calls was historically a graph RELATION (TYPE RELATION IN symbol OUT symbol).
+-- At schema v5 NOTHING traverses the graph: every read path (query_callers/
+-- query_callees in graph_expand.rs, call_graph in ops.rs) reads the denormalized
+-- in_name/out_name/in_file/out_file columns via their secondary indexes. The
+-- RELATION type forced SurrealDB to write graph-adjacency keys (->calls->,
+-- <-calls<-) on EVERY edge insert — pure write amplification. On the Linux kernel
+-- (4.44M edges) this measured ~44% of Phase-2 edge-write time. Flipping to a plain
+-- NORMAL table eliminates that adjacency maintenance with byte-identical query
+-- output (verified: call-graph node/edge digest unchanged). The v5→v6 migration
+-- (run_migration_v5_to_v6) clears old RELATION rows so they are re-resolved as
+-- plain rows. OVERWRITE (not IF NOT EXISTS) so an existing RELATION table is
+-- flipped to NORMAL synchronously on open, before any edge write.
+DEFINE TABLE OVERWRITE calls TYPE NORMAL SCHEMALESS;
 DEFINE FIELD OVERWRITE line     ON calls TYPE int;
 DEFINE FIELD OVERWRITE in_file  ON calls TYPE string;
 DEFINE FIELD OVERWRITE out_file ON calls TYPE string;
