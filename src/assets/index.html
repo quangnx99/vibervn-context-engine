@@ -1161,6 +1161,10 @@
     <div class="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-wiki-border">
       <h3 id="chat-title" data-i18n="chat.title" class="text-sm font-medium text-gray-900 dark:text-wiki-heading">Chat</h3>
       <span id="chat-repo-name" class="font-mono text-xs text-gray-400 dark:text-wiki-text-muted truncate flex-1 mx-3 text-right"></span>
+      <button id="btn-new-chat" data-i18n-aria="chat.newChat" data-i18n-title="chat.newChat" aria-label="New chat"
+              class="text-gray-400 dark:text-wiki-text-muted hover:text-gray-700 dark:hover:text-wiki-text focus:outline-none focus:ring-2 focus:ring-blue-400 rounded p-1 mr-1">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
       <button id="btn-close-chat" aria-label="Close"
               class="text-gray-400 dark:text-wiki-text-muted hover:text-gray-700 dark:hover:text-wiki-text focus:outline-none focus:ring-2 focus:ring-blue-400 rounded p-1">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18L18 6M6 6l12 12"/></svg>
@@ -1502,6 +1506,7 @@ const STR = {
   // Repo chat
   'chat.open':         { en: `Chat`, vi: `Chat`, zh: `对话` },
   'chat.title':        { en: `Chat`, vi: `Chat`, zh: `对话` },
+  'chat.newChat':      { en: `New chat`, vi: `Chat mới`, zh: `新对话` },
   'chat.emptyTitle':   { en: `Ask about this repository`, vi: `Hỏi về repo này`, zh: `询问此仓库` },
   'chat.emptyHint':    { en: `The assistant searches the index with codebase-retrieval and file-retrieval to answer.`,
                          vi: `Trợ lý dùng codebase-retrieval và file-retrieval để tìm trong index và trả lời.`,
@@ -4986,6 +4991,29 @@ function closeChat() {
   chatRepo = null;
 }
 
+// Reset the conversation in place — dialog stays open, scroll lock untouched.
+// Aborts any in-flight stream, drops the old conversation server-side (same
+// teardown as closeChat), then starts a fresh conversation id + empty state.
+function newChat() {
+  if (!chatRepo) return;
+  if (chatAbort) { try { chatAbort.abort(); } catch (e) {} chatAbort = null; }
+  chatBusy = false;
+  const prevRepo = chatRepo;
+  const prevConversationId = chatConversationId;
+  if (prevRepo && prevConversationId) {
+    const repoId = encodeRepoId(prevRepo);
+    fetch(`/api/repos/${repoId}/chat/${encodeURIComponent(prevConversationId)}`, { method: 'DELETE' })
+      .catch(() => {});
+  }
+  chatConversationId = genConversationId();
+  const msgs = document.getElementById('chat-messages');
+  msgs.innerHTML = '';
+  msgs.appendChild(buildChatEmptyState());
+  const input = document.getElementById('chat-input');
+  input.value = '';
+  setTimeout(() => input.focus(), 50);
+}
+
 // ── Message DOM builders ──
 function chatScrollToBottom() {
   const msgs = document.getElementById('chat-messages');
@@ -5219,6 +5247,7 @@ function handleChatEvent(turn, ev, activeSteps, gotToken) {
 // ── Wiring ──
 document.getElementById('btn-open-chat').addEventListener('click', openChat);
 document.getElementById('btn-close-chat').addEventListener('click', closeChat);
+document.getElementById('btn-new-chat').addEventListener('click', newChat);
 document.getElementById('form-chat').addEventListener('submit', (e) => { e.preventDefault(); sendChat(); });
 document.getElementById('chat-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
