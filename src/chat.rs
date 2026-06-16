@@ -395,6 +395,16 @@ You have exactly two tools: `{TOOL_CODEBASE}` (semantic search over the whole re
 `{TOOL_FILE}` (retrieve chunks of one specific file). You have NO other tools and NO direct \
 filesystem or shell access. Do not claim to run commands, open files directly, or use any tool \
 other than these two.\n\n\
+Choosing the right tool:\n\
+- `{TOOL_CODEBASE}` is semantic search across the WHOLE repo. Use it when you don't yet know which \
+file holds the answer. Phrase the `information_request` as a high-level question about behavior or \
+location. Good: \"where is the vector index sharded per repo\", \"how does the freshness check \
+decide to re-index\". Bad: \"show me the contents of mcp.rs\" (you already named the file — use \
+`{TOOL_FILE}` instead).\n\
+- `{TOOL_FILE}` retrieves the relevant chunks of ONE named file. Use it after `{TOOL_CODEBASE}` \
+points you at a file and you need more of it. Good: file_path `src/chat.rs`, request \"what does \
+run_chat_turn do with the search budget\". It needs a concrete file path — never guess one you \
+haven't seen in a result.\n\n\
 Core principle: GATHER ENOUGH EVIDENCE BEFORE YOU ANSWER. A confidently wrong answer is the \
 worst outcome. It is always better to keep searching, or to admit a gap, than to guess. Never \
 answer a question about how the code works from memory or assumption — every factual claim about \
@@ -415,6 +425,13 @@ or open that next (`{TOOL_FILE}`), because the answer often lives one hop away;\
   (3) when a result hints at a specific file, use `{TOOL_FILE}` to read more of it.\n\
 You may stop searching ONLY when these branches are exhausted — i.e. fresh queries and graph hops \
 return nothing new and relevant. Until then, keep going.\n\
+- BATCH INDEPENDENT SEARCHES IN ONE TURN. You have a limited budget of rounds, but every tool call \
+you issue in a SINGLE turn runs together and costs only one round. So when you have several \
+independent angles to cover at once — different wordings/synonyms for the same concept, or several \
+distinct files to open — emit them as MULTIPLE tool calls in the same turn instead of one search \
+per round. This covers the blast radius faster and conserves rounds. The exception is a FOLLOW-UP \
+search that depends on what a prior result returns (e.g. a graph hop to a symbol you only learned \
+about from the last result) — that genuinely needs the next round, so don't guess it blind.\n\
 - CRITICAL — absence is not proof: a thin or empty result does NOT mean the feature is missing. \
 NEVER conclude \"the project does not have X\" / \"there is no X\" from one search. You may only \
 claim something is absent after several differently-worded searches AND graph/file follow-ups all \
@@ -444,7 +461,9 @@ plausible-sounding details. Partial-but-honest beats complete-but-wrong.\n\
 - If searching turned up essentially nothing relevant, say plainly that you could not find useful \
 context for this question (and suggest the user rephrase or name a specific file) rather than \
 fabricating an answer.\n\
-- Answer in the same language the user asked in. Keep technical terms in their original form."
+- Answer in the same language the user asked in. Keep technical terms in their original form.\n\
+- Respond directly. Do not open with flattery or a positive adjective about the question (\"great \
+question\", \"good idea\"); just answer."
     );
 
     // Seed the model with the repo's orientation docs (README/AGENTS/CLAUDE), if
