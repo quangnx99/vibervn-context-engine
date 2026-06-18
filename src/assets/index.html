@@ -940,10 +940,18 @@
       <!-- File browser + detail -->
       <section>
         <h2 data-i18n="files.heading" class="font-wiki text-xl dark:text-wiki-heading text-gray-900 mb-2">Indexed files</h2>
-        <input id="input-file-filter" type="text" placeholder="Filter files…" data-i18n-ph="files.filter"
-               class="hidden w-full mb-3 border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface rounded px-3 py-2 text-sm
-                      text-gray-900 dark:text-wiki-text placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
-                      focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+        <div class="flex gap-2 mb-3">
+          <input id="input-file-filter" type="text" placeholder="Filter files…" data-i18n-ph="files.filter"
+                 class="hidden flex-1 border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface rounded px-3 py-2 text-sm
+                        text-gray-900 dark:text-wiki-text placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                        focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+          <button id="btn-ignore-all" data-i18n="files.ignoreAll" type="button"
+                  class="hidden flex-none px-3 py-2 text-sm rounded border border-gray-200 dark:border-wiki-border
+                         text-gray-600 dark:text-wiki-text-muted hover:text-red-500 dark:hover:text-red-400 hover:border-red-300 dark:hover:border-red-400/50
+                         focus:outline-none focus:ring-2 focus:ring-red-300 disabled:opacity-50 disabled:cursor-not-allowed">
+            Ignore all
+          </button>
+        </div>
         <div id="files-list" class="border border-gray-200 dark:border-wiki-border rounded divide-y divide-gray-100 dark:divide-wiki-border
                     overflow-y-auto" style="max-height: 320px;"></div>
         <div id="files-empty" data-i18n="files.empty" class="hidden text-gray-400 dark:text-wiki-text-muted text-sm mt-2">
@@ -1662,6 +1670,11 @@ const STR = {
   'files.chunkMany':   { en: `{n} chunks`, vi: `{n} chunk`, zh: `{n} 个代码块` },
   'files.ignore':      { en: `Ignore`, vi: `Ignore`, zh: `忽略` },
   'files.ignoreTitle': { en: `Remove from index and skip in future indexing`, vi: `Xóa khỏi index và bỏ qua trong các lần index sau`, zh: `从索引中移除并在后续索引时跳过` },
+  'files.ignoreAll':   { en: `Ignore all`, vi: `Ignore tất cả`, zh: `全部忽略` },
+  'files.ignoreAllTitle': { en: `Ignore every file matching the current filter`, vi: `Ignore mọi file khớp với filter hiện tại`, zh: `忽略与当前筛选匹配的所有文件` },
+  'files.ignoreAllDone': { en: `Ignored {n} files — running incremental update…`, vi: `Đã ignore {n} file — đang chạy incremental update…`, zh: `已忽略 {n} 个文件 — 正在运行增量更新…` },
+  'files.ignoreAllNone': { en: `No files match the current filter`, vi: `Không có file nào khớp với filter hiện tại`, zh: `没有文件与当前筛选匹配` },
+  'files.ignoreAllFail': { en: `Ignore all failed: {msg}`, vi: `Ignore tất cả thất bại: {msg}`, zh: `全部忽略失败：{msg}` },
   'files.restore':     { en: `Restore`, vi: `Khôi phục`, zh: `恢复` },
   'files.ignoredHeading': { en: `Ignored files`, vi: `File đã ignore`, zh: `已忽略的文件` },
   'chunk.loading':     { en: `Loading chunks…`, vi: `Đang tải chunk…`, zh: `正在加载代码块…` },
@@ -4342,6 +4355,7 @@ function renderFiles() {
   listEl.innerHTML = '';
 
   filterInput.classList.remove('hidden');
+  syncIgnoreAllVisibility();
 
   if (explorerFiles.length === 0) {
     emptyEl.classList.remove('hidden');
@@ -4402,11 +4416,52 @@ function renderFiles() {
 let fileFilterTimer = 0;
 document.getElementById('input-file-filter').addEventListener('input', (e) => {
   explorerFileFilter = e.target.value;
+  syncIgnoreAllVisibility();
   clearTimeout(fileFilterTimer);
   fileFilterTimer = setTimeout(() => {
     const token = ++explorerLoadToken;
     loadExplorerFiles(token);
   }, 300);
+});
+
+// "Ignore all" is only meaningful with an active filter — an empty filter would
+// match the whole repo. Show it only when the filter box has text.
+function syncIgnoreAllVisibility() {
+  const btn = document.getElementById('btn-ignore-all');
+  if (!btn) return;
+  const active = explorerFileFilter.trim().length > 0;
+  btn.classList.toggle('hidden', !active);
+  btn.title = t('files.ignoreAllTitle');
+}
+
+document.getElementById('btn-ignore-all').addEventListener('click', async () => {
+  const filter = explorerFileFilter.trim();
+  if (!filter || !currentSearchRepo) return;
+  const btn = document.getElementById('btn-ignore-all');
+  btn.disabled = true;
+  try {
+    const repoId = encodeRepoId(currentSearchRepo);
+    const res = await fetch('/api/repos/' + repoId + '/ignore-files', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filter }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    if (!data.count) {
+      setExplorerActionStatus(t('files.ignoreAllNone'));
+      return;
+    }
+    setExplorerActionStatus(t('files.ignoreAllDone', { n: data.count }));
+    await loadIgnoredFiles();
+    // Re-resolve the blast radius of the deleted files (callers pointing at the
+    // now-gone symbols) and refresh the explorer when indexing settles.
+    await triggerIndexAction('/index', 'Incremental Update', 'btn-ignore-all', t('explorer.incQueued'));
+  } catch (e) {
+    setExplorerActionStatus(t('files.ignoreAllFail', { msg: e.message }), true);
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 // ─── Ignored files ────────────────────────────────────────────────────────────
@@ -4423,6 +4478,11 @@ async function loadIgnoredFiles() {
     if (paths.length === 0) { section.classList.add('hidden'); return; }
     section.classList.remove('hidden');
     listEl.innerHTML = '';
+    // KNOWN UNBOUNDED REMAINDER (intentional, out of scope for batch-ignore):
+    // a very broad "Ignore all" can produce tens of thousands of ignored paths,
+    // and this renders one DOM row each. Acceptable today; if the ignore count
+    // gets large in practice, paginate/virtualize this list (paired with the
+    // ignored_paths blob note in store/ops.rs set_ignored_paths).
     paths.forEach((relP) => {
       const row = document.createElement('div');
       row.className = 'flex items-center gap-3 px-3 py-2 text-sm';

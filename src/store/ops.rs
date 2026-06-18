@@ -583,6 +583,14 @@ pub async fn get_ignored_paths(db: &Surreal<Db>) -> Result<Vec<String>> {
 }
 
 /// Set per-repo ignored paths (forward-slash-normalized relative paths).
+//
+// KNOWN UNBOUNDED REMAINDER (intentional, out of scope for the batch-ignore
+// work): ignored_paths is a single JSON blob in index_meta. An "Ignore all" on
+// a very broad filter can push tens of thousands of paths in here, so the blob
+// (and the get/parse/serialize on every later ignore/restore) grows with the
+// ignore count. Acceptable today — it only costs when someone ignores extremely
+// widely. If that becomes a real workload, promote ignored_paths to its own
+// table with keyset paging (a schema change) rather than a blob.
 pub async fn set_ignored_paths(db: &Surreal<Db>, paths: &[String]) -> Result<()> {
     let json_str = serde_json::to_string(paths).context("serialize ignored_paths")?;
     set_meta(db, "ignored_paths", &json_str).await
@@ -839,6 +847,234 @@ pub async fn files_page(
             size: m.size,
         })
         .collect())
+}
+
+/// One keyset PAGE of file paths (absolute, as stored in file_meta) matching a
+/// name filter, ordered by path, strictly after `after` (pass "" for the first
+/// page). Bounded to `limit` rows — the caller loops, advancing `after` to the
+/// last returned path, until a short page signals the end.
+///
+/// Why keyset and not a single unbounded SELECT: at kernel scale a broad filter
+/// (".c", "s") matches tens of thousands of rows; materializing them all in one
+/// Vec is the unbounded-memory growth the project forbids. `path > $after` rides
+/// the UNIQUE `idx_filemeta_path`, so total scan across all pages is O(N) — never
+/// the O(N²) of OFFSET paging (measured in SurrealDB 2.6.5). Same case-insensitive
+/// CONTAINS predicate as `files_page`; the CONTAINS only filters within the
+/// index-driven range, it does not drive the scan.
+pub async fn paths_matching_filter_page(
+    db: &Surreal<Db>,
+    repo: &str,
+    filter: &str,
+    after: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    #[derive(Deserialize)]
+    struct PathRow {
+        path: String,
+    }
+    let rows: Vec<PathRow> = db
+        .query(
+            "SELECT path FROM file_meta \
+             WHERE repo = $repo AND path > $after \
+             AND string::lowercase(path) CONTAINS string::lowercase($filter) \
+             ORDER BY path LIMIT $limit",
+        )
+        .bind(("repo", repo.to_string()))
+        .bind(("after", after.to_string()))
+        .bind(("filter", filter.to_string()))
+        .bind(("limit", limit as i64))
+        .await
+        .context("paths_matching_filter_page: file_meta")?
+        .take(0)?;
+    Ok(rows.into_iter().map(|r| r.path).collect())
+}
+
+#[cfg(test)]
+mod paths_matching_filter_tests {
+    use super::*;
+    use crate::store::open_db;
+    use std::collections::HashSet;
+    use tempfile::TempDir;
+
+    async fn seed(db: &Surreal<Db>, repo: &str, paths: &[&str]) {
+        for p in paths {
+            upsert_file_meta(
+                db,
+                &FileMeta {
+                    path: p.to_string(),
+                    mtime: 1,
+                    size: 1,
+                    repo: repo.to_string(),
+                    chunk_count: 1,
+                    chunker_version: crate::parsing::chunker::CHUNKER_VERSION,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Drain every keyset page for a filter, mirroring the handler's loop, and
+    /// return the full ordered match set. Asserts each page is bounded by `batch`.
+    async fn drain_all(db: &Surreal<Db>, repo: &str, filter: &str, batch: usize) -> Vec<String> {
+        let mut cursor = String::new();
+        let mut all = Vec::new();
+        loop {
+            let page = paths_matching_filter_page(db, repo, filter, &cursor, batch)
+                .await
+                .unwrap();
+            assert!(page.len() <= batch, "page must be bounded by batch size");
+            if page.is_empty() {
+                break;
+            }
+            cursor = page[page.len() - 1].clone();
+            let short = page.len() < batch;
+            all.extend(page);
+            if short {
+                break;
+            }
+        }
+        all
+    }
+
+    /// The filter must be case-insensitive, substring-based, and repo-scoped.
+    #[tokio::test]
+    async fn matches_substring_case_insensitive() {
+        let home = TempDir::new().unwrap();
+        let repo = "/repo/match_test";
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+        seed(
+            &db,
+            repo,
+            &[
+                "/repo/match_test/openspec/a.md",
+                "/repo/match_test/OpenSpec/b.md",
+                "/repo/match_test/src/main.rs",
+            ],
+        )
+        .await;
+
+        // Pages come back ORDER BY path, so drain_all is already sorted.
+        let got = drain_all(&db, repo, "openspec", 1000).await;
+        assert_eq!(
+            got,
+            vec![
+                "/repo/match_test/OpenSpec/b.md".to_string(),
+                "/repo/match_test/openspec/a.md".to_string(),
+            ],
+            "case-insensitive substring match on path"
+        );
+
+        let none = drain_all(&db, repo, "nonexistent", 1000).await;
+        assert!(none.is_empty(), "no match returns empty");
+    }
+
+    /// A filter must never leak paths from another repo sharing the same DB
+    /// (defense in depth — repos are separate DBs in production but the WHERE
+    /// repo clause is the contract).
+    #[tokio::test]
+    async fn scoped_to_repo() {
+        let home = TempDir::new().unwrap();
+        let repo = "/repo/scope_test";
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+        seed(&db, repo, &["/repo/scope_test/x.rs"]).await;
+        seed(&db, "/other/repo", &["/other/repo/x.rs"]).await;
+
+        let got = drain_all(&db, repo, "x.rs", 1000).await;
+        assert_eq!(got, vec!["/repo/scope_test/x.rs".to_string()]);
+    }
+
+    /// Keyset paging with a tiny batch must return EVERY match exactly once,
+    /// with no gaps or duplicates across page boundaries — this is the property
+    /// that makes the unbounded match set safe to process O(BATCH) at a time.
+    #[tokio::test]
+    async fn keyset_pages_cover_all_matches_no_gaps_no_dupes() {
+        let home = TempDir::new().unwrap();
+        let repo = "/repo/page_test";
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+        // 25 matching ".c" files + a few non-matching, all under one repo.
+        let mut seeded = Vec::new();
+        for i in 0..25 {
+            seeded.push(format!("/repo/page_test/src/file{i:03}.c"));
+        }
+        let noise = ["/repo/page_test/readme.md", "/repo/page_test/main.rs"];
+        let refs: Vec<&str> = seeded.iter().map(|s| s.as_str()).chain(noise).collect();
+        seed(&db, repo, &refs).await;
+
+        // Batch of 7 forces 4 pages (7+7+7+4) with a partial final page.
+        let got = drain_all(&db, repo, ".c", 7).await;
+        assert_eq!(got.len(), 25, "every .c match returned exactly once");
+        let unique: HashSet<&String> = got.iter().collect();
+        assert_eq!(unique.len(), 25, "no duplicates across page boundaries");
+        let mut expected = seeded.clone();
+        expected.sort();
+        assert_eq!(got, expected, "pages cover all matches in path order");
+    }
+
+    /// Crash / half-batch consistency: simulate the handler dying after the
+    /// first page is processed (ignored-marker written + data deleted) but
+    /// before the rest. The invariant must hold — every processed path is BOTH
+    /// in ignored_paths AND gone from file_meta; every unprocessed path is
+    /// NEITHER ignored NOR deleted (still fully indexed).
+    #[tokio::test]
+    async fn half_batch_leaves_consistent_state() {
+        let home = TempDir::new().unwrap();
+        let repo = "/repo/half_test";
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+        let mut seeded = Vec::new();
+        for i in 0..20 {
+            seeded.push(format!("/repo/half_test/m{i:02}.c"));
+        }
+        let refs: Vec<&str> = seeded.iter().map(|s| s.as_str()).collect();
+        seed(&db, repo, &refs).await;
+
+        // Process exactly ONE page of 8, then stop (simulating a crash before
+        // the next page) — marker FIRST, then delete, exactly as the handler does.
+        let page = paths_matching_filter_page(&db, repo, ".c", "", 8).await.unwrap();
+        assert_eq!(page.len(), 8);
+        let root = std::path::Path::new(repo);
+        let relatives: Vec<String> = page
+            .iter()
+            .map(|abs| {
+                std::path::Path::new(abs)
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .replace('\\', "/")
+            })
+            .collect();
+        set_ignored_paths(&db, &relatives).await.unwrap(); // 1. durable marker
+        delete_files_data_bulk(&db, &page).await.unwrap(); //  2. delete
+
+        // --- assert the invariant ---
+        let ignored: HashSet<String> = get_ignored_paths(&db).await.unwrap().into_iter().collect();
+        let remaining: HashSet<String> = drain_all(&db, repo, ".c", 1000).await.into_iter().collect();
+
+        for abs in &page {
+            let rel = std::path::Path::new(abs)
+                .strip_prefix(root)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace('\\', "/");
+            assert!(ignored.contains(&rel), "processed path must be in ignore list: {rel}");
+            assert!(!remaining.contains(abs), "processed path must be deleted from file_meta: {abs}");
+        }
+        for abs in seeded.iter().filter(|p| !page.contains(p)) {
+            let rel = std::path::Path::new(abs)
+                .strip_prefix(root)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace('\\', "/");
+            assert!(!ignored.contains(&rel), "unprocessed path must NOT be ignored: {rel}");
+            assert!(remaining.contains(abs), "unprocessed path must still be indexed: {abs}");
+        }
+        // ignored ⊇ deleted: the marker never lags the delete.
+        assert_eq!(ignored.len(), 8, "exactly the processed page is ignored");
+        assert_eq!(remaining.len(), 12, "exactly the unprocessed remainder survives");
+    }
 }
 
 /// A chunk detail row (no embedding floats — only the dimension count).

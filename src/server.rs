@@ -218,6 +218,7 @@ pub fn build_router(
         .route("/api/repos/:repo_id/index-stats", get(get_index_stats))
         .route("/api/repos/:repo_id/files", get(get_repo_files))
         .route("/api/repos/:repo_id/ignore-file", post(post_ignore_file))
+        .route("/api/repos/:repo_id/ignore-files", post(post_ignore_files))
         .route("/api/repos/:repo_id/unignore-file", post(post_unignore_file))
         .route("/api/repos/:repo_id/ignored-files", get(get_ignored_files))
         .route("/api/repos/:repo_id/graph", get(get_repo_graph))
@@ -808,6 +809,149 @@ async fn post_ignore_file(
     }
 
     Json(json!({ "status": "ok", "ignored": relative })).into_response()
+}
+
+/// POST /api/repos/:repo_id/ignore-files — batch-ignore every file whose path
+/// matches a name filter (the Index Explorer search box).
+///
+/// Processes the match set in keyset PAGES of `BATCH` (never materializes the
+/// whole set), so peak RAM and the size of every `IN $paths` array stay O(BATCH)
+/// regardless of how many files match — a broad filter at kernel scale can match
+/// tens of thousands. Returns the count ignored.
+///
+/// Crash-safety / consistency invariant — per page, in this exact order:
+/// first persist the page's relative paths into `ignored_paths` (the DURABLE
+/// marker), then delete the page's DB data, then evict the page's vectors from
+/// the in-memory shard.
+///
+/// If the process dies after the marker write but before the delete/evict, the
+/// file is already in the ignore list, so the walker skips it on the next index
+/// (O(1) HashSet lookup in walker.rs `allows`/`walk_repo_with`) — the stale
+/// chunks left behind are never re-indexed and are dropped on the next full
+/// rebuild. The marker therefore always dominates the delete (ignored ⊇ deleted),
+/// never the reverse, so there is no silent-corruption window where a file_meta
+/// row survives without its chunks yet still looks freshly indexed. If a mid-loop
+/// page fails, every page already processed is in the consistent ignored+deleted
+/// state and the unhandled remainder is untouched (still indexed, not ignored);
+/// we surface the error with the count committed so far.
+/// the count committed so far.
+async fn post_ignore_files(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    /// Page size for the keyset loop. Bounds peak RAM and every `IN $paths`
+    /// array to this many paths, independent of total match count.
+    const BATCH: usize = 1000;
+
+    let repo = match decode_repo_id(&repo_id) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    let filter = match body.get("filter").and_then(|v| v.as_str()) {
+        Some(f) if !f.trim().is_empty() => f.trim().to_string(),
+        // Refuse an empty filter: it would match (and ignore) the whole repo.
+        _ => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "missing or empty 'filter' field" }))).into_response();
+        }
+    };
+
+    // Acquire per-repo lock (same lock the pipeline consumer uses).
+    let lock = state.index_engine.get_repo_lock_public(&repo).await;
+    let _guard = lock.lock().await;
+
+    let generation = repo_generation(&state, &repo).await;
+    let db = match store::get_or_open(&state.repo_dbs, &state.data_dir, &repo, generation).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("db: {e}") }))).into_response();
+        }
+    };
+
+    let root = std::path::Path::new(&repo);
+
+    // Load the existing ignore list once and dedup with a HashSet — `Vec::contains`
+    // in a loop over the match set is O(N²) (the project forbids it). We mutate the
+    // set in memory and re-persist after each page so the durable marker advances
+    // with the deletes.
+    let mut ignored_vec = store::ops::get_ignored_paths(&db).await.unwrap_or_default();
+    let mut ignored_set: std::collections::HashSet<String> = ignored_vec.iter().cloned().collect();
+
+    let mut cursor = String::new();
+    let mut total: usize = 0;
+
+    loop {
+        let abs_paths = match store::ops::paths_matching_filter_page(&db, &repo, &filter, &cursor, BATCH).await {
+            Ok(p) => p,
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("match: {e}"), "count": total }))).into_response();
+            }
+        };
+        if abs_paths.is_empty() {
+            break;
+        }
+        // Advance the keyset cursor to the last path of this page (paths are
+        // ORDER BY path; the raw string compares identically to the SQL `>`).
+        cursor = abs_paths[abs_paths.len() - 1].clone();
+        let page_len = abs_paths.len();
+
+        // Derive forward-slash relative paths for the ignore list (mirrors post_ignore_file).
+        let relatives: Vec<String> = abs_paths
+            .iter()
+            .filter_map(|abs| {
+                std::path::Path::new(abs)
+                    .strip_prefix(root)
+                    .ok()
+                    .and_then(|rel| rel.to_str())
+                    .map(|s| s.replace('\\', "/"))
+                    .filter(|s| !s.is_empty())
+            })
+            .collect();
+
+        // 1. DURABLE MARKER FIRST — merge this page into ignored_paths and persist,
+        //    BEFORE deleting any data (see crash-safety invariant above).
+        let mut added = false;
+        for rel in relatives {
+            if ignored_set.insert(rel.clone()) {
+                ignored_vec.push(rel);
+                added = true;
+            }
+        }
+        if added
+            && let Err(e) = store::ops::set_ignored_paths(&db, &ignored_vec).await
+        {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("set ignored: {e}"), "count": total }))).into_response();
+        }
+
+        // 2. Delete this page's data from the DB.
+        if let Err(e) = store::ops::delete_files_data_bulk(&db, &abs_paths).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("delete: {e}"), "count": total }))).into_response();
+        }
+
+        // 3. Evict this page's vectors from the in-memory shard.
+        {
+            let mut vi = state.index_engine.vector_index.write().await;
+            vi.apply_incremental(&repo, &abs_paths, &[], &[]);
+        }
+
+        total += page_len;
+        // A short page means we've reached the end of the match set.
+        if page_len < BATCH {
+            break;
+        }
+    }
+
+    if total == 0 {
+        return Json(json!({ "status": "ok", "count": 0 })).into_response();
+    }
+
+    // The shard changed → invalidate the persisted file so the next warm rebuilds it.
+    {
+        let shard_root = crate::vector::shard_file::repo_shard_root(&state.index_engine.data_dir, &repo);
+        let _ = std::fs::remove_file(shard_root.join("CURRENT"));
+    }
+
+    Json(json!({ "status": "ok", "count": total })).into_response()
 }
 
 /// POST /api/repos/:repo_id/unignore-file — restore a file (remove from ignore list).
